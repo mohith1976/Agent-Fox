@@ -1,0 +1,40 @@
+{
+  "name": "agent-fox",
+  "version": "1.0.0",
+  "main": "index.js",
+  "scripts": {
+    "test": "npm test --workspaces",
+    "dev:api": "npm run start:dev --workspace=apps/api",
+    "dev:web": "npm run dev --workspace=apps/web",
+    "build": "npm run build --workspaces",
+    "format": "prettier --write .",
+    "format:check": "prettier --check ."
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/mohith1976/Agent-Fox.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/mohith1976/Agent-Fox/issues"
+  },
+  "homepage": "https://github.com/mohith1976/Agent-Fox#readme",
+  "description": "",
+  "private": "true",
+  "workspaces": [
+    "apps/*"
+  ],
+  "devDependencies": {
+    "eslint-config-prettier": "^10.1.8",
+    "eslint-plugin-prettier": "^5.5.6",
+    "prettier": "^3.9.6"
+  },
+  "dependencies": {
+    "@prisma/adapter-pg": "^7.10.0",
+    "@prisma/client": "^7.10.0",
+    "pg": "^8.23.0",
+    "prisma": "^7.10.0"
+  }
+}

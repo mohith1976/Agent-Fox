@@ -1,0 +1,31 @@
+services:
+  postgres:
+    image: postgres:17
+    container_name: agent-fox-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: agent_fox
+      POSTGRES_PASSWORD: agent_fox_dev
+      POSTGRES_DB: agent_fox
+    ports:
+      - '5433:5432'
+    volumes:
+      - agent_fox_postgres_data:/var/lib/postgresql/data
+
+  localstack:
+    image: localstack/localstack:latest
+    container_name: agent-fox-localstack
+    restart: unless-stopped
+    ports:
+      - '4566:4566'
+    environment:
+      SERVICES: s3
+      AWS_DEFAULT_REGION: ap-south-1
+      DEBUG: 0
+      LOCALSTACK_AUTH_TOKEN: ${LOCALSTACK_AUTH_TOKEN}
+    volumes:
+      - agent_fox_localstack_data:/var/lib/localstack
+
+volumes:
+  agent_fox_postgres_data:
+  agent_fox_localstack_data:

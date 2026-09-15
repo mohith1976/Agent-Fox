@@ -1,0 +1,53 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+model AgentWorkflow {
+  id          String    @id @default(uuid()) @db.Uuid
+  name        String
+  triggerCode String    @map("trigger_code")
+  description String?
+  prompt      String?
+  toolsId     Json?     @map("tools_id")
+  createdAt   DateTime  @default(now()) @map("created_at")
+  updatedAt   DateTime  @updatedAt @map("updated_at")
+  deletedAt   DateTime? @map("deleted_at")
+
+  flowTrackings FlowTracking[]
+
+  @@map("agent_workflows")
+}
+
+model ToolDefinition {
+  pid         String    @id @default(uuid()) @db.Uuid
+  name        String
+  description String?
+  toolCode    String    @map("tool_code")
+  createdAt   DateTime  @default(now()) @map("created_at")
+  updatedAt   DateTime  @updatedAt @map("updated_at")
+  deletedAt   DateTime? @map("deleted_at")
+
+  @@map("tool_definitions")
+}
+
+model FlowTracking {
+  id         String    @id @default(uuid()) @db.Uuid
+  workflowId String    @map("workflow_id") @db.Uuid
+  status     String
+  data       Json?
+  cost       Decimal?  @db.Decimal(12, 6)
+  tokens     Int?
+  model      String?
+  createdAt  DateTime  @default(now()) @map("created_at")
+  updatedAt  DateTime  @updatedAt @map("updated_at")
+  deletedAt  DateTime? @map("deleted_at")
+
+  workflow AgentWorkflow @relation(fields: [workflowId], references: [id])
+
+  @@index([workflowId])
+  @@map("flow_trackings")
+}

@@ -1,0 +1,27 @@
+.loading-state {
+  display: flex;
+  align-items: center;
+  gap: 0.625rem;
+  color: #6b7280;
+  font-size: 0.875rem;
+  padding: 0.75rem 0;
+}
+
+.loading-state__spinner {
+  width: 1rem;
+  height: 1rem;
+  border: 2px solid #e5e7eb;
+  border-top-color: #2563eb;
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.loading-state__text {
+  font-style: italic;
+}

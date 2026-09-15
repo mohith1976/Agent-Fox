@@ -1,0 +1,53 @@
+# Dependencies
+node_modules/
+.pnpm-store/
+
+# Environment variables
+.env
+.env.*
+!.env.example
+
+# Build output
+dist/
+build/
+coverage/
+
+# Vite
+apps/web/dist/
+
+# NestJS
+apps/api/dist/
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+pnpm-debug.log*
+
+# IDE
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Temporary files
+*.tmp
+*.temp
+
+# Test artifacts
+test-results/
+
+# Local development data
+.local/
+/generated/prisma
+# Generated Prisma client
+apps/api/src/generated/prisma
+
+# Generated documentation (kept in Knowledge/ for reference)
+docs/*.md
+!docs/README_CURRENT_STATUS.md
+Knowledge/*.md
