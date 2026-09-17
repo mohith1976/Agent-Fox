@@ -1,9 +1,10 @@
 import { Injectable, Logger } from '@nestjs/common';
-import { AzureAIService } from './azure-ai.service';
+import { AzureAIService, EMPTY_USAGE } from './azure-ai.service';
 import {
   CategoryInferenceInput,
   CategoryInferenceResult,
   ColourCategory,
+  WithUsage,
 } from './llm.types';
 
 /**
@@ -23,7 +24,7 @@ export class CategoryInferenceService {
    */
   async inferCategory(
     input: CategoryInferenceInput,
-  ): Promise<CategoryInferenceResult> {
+  ): Promise<WithUsage<CategoryInferenceResult>> {
     this.logger.log(
       `Inferring category for: "${input.description}" (${input.direction})`,
     );
@@ -34,6 +35,7 @@ export class CategoryInferenceService {
         category: null,
         reasoning: 'Credits never receive category colors',
         wishlistMatch: false,
+        usage: EMPTY_USAGE,
       };
     }
 
@@ -106,7 +108,7 @@ Provide reasoning for your decision.`;
     };
 
     try {
-      const result =
+      const { data: result, usage } =
         await this.azureAI.getStructuredCompletion<CategoryInferenceResult>(
           messages,
           {
@@ -124,7 +126,7 @@ Provide reasoning for your decision.`;
         `Category inferred: ${result.category} (wishlist: ${result.wishlistMatch})`,
       );
 
-      return result;
+      return { ...result, usage };
     } catch (error) {
       this.logger.error(
         `Category inference failed: ${error instanceof Error ? error.message : String(error)}`,
@@ -134,6 +136,7 @@ Provide reasoning for your decision.`;
         category: null,
         reasoning: 'Inference failed',
         wishlistMatch: false,
+        usage: EMPTY_USAGE,
       };
     }
   }

@@ -18,11 +18,14 @@ export class WorkbookRulesService {
   /**
    * Apply row color based on direction and category
    * CRITICAL RULE: Credits NEVER receive category colors
+   * @param fromCol - First column to color (3/C for month sheets,
+   *   2/B for CASH TRACKER whose rows start at the Month column)
    */
   applyRowColor(
     row: ExcelJS.Row,
     direction: TransactionDirection,
     category: CategoryColor | null,
+    fromCol: number = 3,
   ): void {
     // Enforce credit no-color rule
     if (direction === 'CREDIT') {
@@ -35,7 +38,7 @@ export class WorkbookRulesService {
     // Debit with category
     if (direction === 'DEBIT' && category) {
       const color = this.getCategoryColor(category);
-      this.applyColorToRow(row, color);
+      this.applyColorToRow(row, color, fromCol);
     } else {
       // Debit without category - apply base fill or no fill
       this.applyBaseFill(row);
@@ -67,15 +70,20 @@ export class WorkbookRulesService {
   }
 
   /**
-   * Apply color fill to all cells in a row (columns B-I for CASH TRACKER, C-I for month sheets)
+   * Apply color fill to all cells in a row (fromCol through I — covers Date,
+   * Description, Mode, Debit, Credit, Balances, plus Month on CASH TRACKER)
    */
-  private applyColorToRow(row: ExcelJS.Row, argbColor: string): void {
+  private applyColorToRow(
+    row: ExcelJS.Row,
+    argbColor: string,
+    fromCol: number = 3,
+  ): void {
     if (!argbColor) {
       return;
     }
 
-    // Apply to relevant columns (C through I covers Date, Description, Mode, Debit, Credit, Balances)
-    for (let col = 3; col <= 9; col++) {
+    // Apply to relevant columns (through I covers Date, Description, Mode, Debit, Credit, Balances)
+    for (let col = fromCol; col <= 9; col++) {
       const cell = row.getCell(col);
       cell.style = {
         ...cell.style,
@@ -198,7 +206,11 @@ export class WorkbookRulesService {
 
   /**
    * Determine category based on description and Wishlist
+   * Maps EVERY user-defined TERMINOLOGY list to its color, so rows color
+   * deterministically even when the LLM suggests no category (suggested
+   * null). Case-insensitive word-boundary matching via matchWishlist.
    * Returns suggested category, which can be overridden by explicit input
+   * (callers only consult this when no explicit category exists).
    */
   determineCategoryFromDescription(
     description: string,
@@ -207,12 +219,19 @@ export class WorkbookRulesService {
     const wishlistMatch = this.matchWishlist(description, wishlistData);
 
     if (wishlistMatch.matched) {
-      // Wishlist items should be categorized as WISHLIST_EXPENSE
-      // (unless explicitly overridden by caller)
-      return 'WISHLIST_EXPENSE';
+      switch (wishlistMatch.category) {
+        case 'WISHLIST':
+          return 'WISHLIST_EXPENSE';
+        case 'PERSONAL':
+          return 'PERSONAL_EXPENSE';
+        case 'FOR_HOME':
+          return 'HOME_EXPENSE';
+        default:
+          return null;
+      }
     }
 
-    // No automatic category inference for non-Wishlist items
+    // No automatic category inference for non-listed items
     return null;
   }
 }

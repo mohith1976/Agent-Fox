@@ -4,29 +4,29 @@
  * Manages chat state, messages, and API communication
  */
 
-import { useState, useRef, useCallback } from 'react';
+import { useState, useCallback } from 'react';
 import { sendChatMessage, ChatApiError } from '../api/chat.api';
 import type { Message, PendingTransaction } from '../types/chat.types';
-import { generateRequestId, generateThreadId } from '../utils/ids';
+import { generateRequestId } from '../utils/ids';
 
 export interface UseChatReturn {
   messages: Message[];
   isLoading: boolean;
   error: string | null;
-  threadId: string;
   pendingBatch: PendingTransaction[] | null;
   sendMessage: (content: string) => Promise<void>;
   clearError: () => void;
+  setRecoveredState: (state: {
+    messages: Message[];
+    pendingBatch: PendingTransaction[] | null;
+  }) => void;
 }
 
-export function useChat(): UseChatReturn {
+export function useChat(threadId: string): UseChatReturn {
   const [messages, setMessages] = useState<Message[]>([]);
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [pendingBatch, setPendingBatch] = useState<PendingTransaction[] | null>(null);
-  
-  // threadId persists for the session
-  const threadIdRef = useRef<string>(generateThreadId());
 
   const sendMessage = useCallback(async (content: string) => {
     if (!content.trim()) {
@@ -39,7 +39,6 @@ export function useChat(): UseChatReturn {
 
     // Generate unique requestId for this message
     const requestId = generateRequestId();
-    const threadId = threadIdRef.current;
 
     // Add user message immediately
     const userMessage: Message = {
@@ -57,6 +56,7 @@ export function useChat(): UseChatReturn {
         requestId,
         threadId,
         message: content.trim(),
+        triggerCode: 'manual', // ✅ FIXED: Match DB trigger_code
       });
 
       // Update pending batch state
@@ -101,19 +101,30 @@ export function useChat(): UseChatReturn {
     } finally {
       setIsLoading(false);
     }
-  }, []);
+  }, [threadId]);
 
   const clearError = useCallback(() => {
     setError(null);
   }, []);
 
+  const setRecoveredState = useCallback(
+    (state: {
+      messages: Message[];
+      pendingBatch: PendingTransaction[] | null;
+    }) => {
+      setMessages(state.messages);
+      setPendingBatch(state.pendingBatch);
+    },
+    [],
+  );
+
   return {
     messages,
     isLoading,
     error,
-    threadId: threadIdRef.current,
     pendingBatch,
     sendMessage,
     clearError,
+    setRecoveredState,
   };
 }

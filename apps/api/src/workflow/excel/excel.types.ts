@@ -89,6 +89,24 @@ export interface TransactionFilters {
   dateTo?: string;
   tags?: string[];
   descriptionContains?: string;
+  /**
+   * Max rows to return, newest-first by date ("latest transaction" → 1).
+   * Applied AFTER all other filters.
+   */
+  limit?: number | null;
+}
+
+/**
+ * Current balances read from the workbook itself (last-row running balances
+ * per mode). This is the AUTHORITATIVE answer for "balance" questions —
+ * never recompute balances by summing transactions.
+ * Null when the mode column has no recorded balance.
+ */
+export interface SheetBalances {
+  PHONEPAY: number | null;
+  WALLET: number | null;
+  MONEY: number | null;
+  BANK: number | null;
 }
 
 /**

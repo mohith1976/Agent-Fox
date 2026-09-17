@@ -1,6 +1,14 @@
 import { Injectable, Logger } from '@nestjs/common';
-import { AzureAIService } from './azure-ai.service';
-import { IntentClassificationResult, IntentType } from './llm.types';
+import { AzureAIService, EMPTY_USAGE } from './azure-ai.service';
+import {
+  IntentClassificationResult,
+  IntentType,
+  WithUsage,
+} from './llm.types';
+import {
+  getIntentClassifierSystemPrompt,
+  INTENT_CLASSIFIER_SCHEMA,
+} from './prompts/intent-classifier.prompts';
 
 /**
  * Intent Classifier
@@ -16,32 +24,23 @@ export class IntentClassifier {
    * Classify the user's intent
    * @param userMessage - The user's natural language message
    * @param hasPendingBatch - Whether there's a pending transaction batch awaiting confirmation
+   * @param hasPriorResults - Whether the thread already holds retrieved transactions
+   *   (lets follow-ups like "give their details" resolve to ANALYTICAL_QUERY)
    * @returns Intent classification result
    */
   async classify(
     userMessage: string,
     hasPendingBatch: boolean = false,
-  ): Promise<IntentClassificationResult> {
+    hasPriorResults: boolean = false,
+  ): Promise<WithUsage<IntentClassificationResult>> {
     this.logger.log(
       `Classifying intent for message: "${userMessage.substring(0, 50)}..."`,
     );
 
-    const systemPrompt = `You are an intent classifier for a personal finance application.
-
-The user can:
-1. Record new transactions (e.g., "1000 phnpe harsha restaurant", "headset 2000 money")
-2. Ask analytical questions (e.g., "how much did I spend this month?", "show me party expenses")
-3. Respond to a pending transaction batch with edits or confirmation (e.g., "edit item 2 amount to 500", "confirm", "yes")
-
-${hasPendingBatch ? 'IMPORTANT: There is currently a PENDING transaction batch awaiting the user\'s response.' : ''}
-
-Classify the user's intent into one of:
-- NEW_TRANSACTION_BATCH: User is recording new transactions
-- ANALYTICAL_QUERY: User is asking a question or requesting analysis/charts
-- EDIT_OR_CONFIRM: User is editing or confirming a pending batch
-- UNKNOWN: Cannot determine intent
-
-Return a confidence score (0-1) and brief reasoning.`;
+    const systemPrompt = getIntentClassifierSystemPrompt(
+      hasPendingBatch,
+      hasPriorResults,
+    );
 
     const messages: Array<{
       role: 'system' | 'user' | 'assistant';
@@ -57,54 +56,30 @@ Return a confidence score (0-1) and brief reasoning.`;
       },
     ];
 
-    const schema = {
-      type: 'object' as const,
-      properties: {
-        intent: {
-          type: 'string' as const,
-          enum: [
-            'NEW_TRANSACTION_BATCH',
-            'ANALYTICAL_QUERY',
-            'EDIT_OR_CONFIRM',
-            'UNKNOWN',
-          ],
-        },
-        confidence: {
-          type: 'number' as const,
-          minimum: 0,
-          maximum: 1,
-        },
-        reasoning: {
-          type: 'string' as const,
-        },
-      },
-      required: ['intent', 'confidence', 'reasoning'],
-      additionalProperties: false,
-    };
-
     try {
-      const result = await this.azureAI.getStructuredCompletion<{
-        intent: IntentType;
-        confidence: number;
-        reasoning: string;
-      }>(
-        messages,
-        {
-          type: 'json_schema',
-          json_schema: {
-            name: 'intent_classification',
-            strict: true,
-            schema,
+      const { data: result, usage } =
+        await this.azureAI.getStructuredCompletion<{
+          intent: IntentType;
+          confidence: number;
+          reasoning: string;
+        }>(
+          messages,
+          {
+            type: 'json_schema',
+            json_schema: {
+              name: 'intent_classification',
+              strict: true,
+              schema: INTENT_CLASSIFIER_SCHEMA,
+            },
           },
-        },
-        1, // gpt-5-mini requires temperature=1
-      );
+          1, // gpt-5-mini requires temperature=1
+        );
 
       this.logger.log(
         `Intent classified: ${result.intent} (confidence: ${result.confidence})`,
       );
 
-      return result;
+      return { ...result, usage };
     } catch (error) {
       this.logger.error(
         `Intent classification failed: ${error instanceof Error ? error.message : String(error)}`,
@@ -114,6 +89,7 @@ Return a confidence score (0-1) and brief reasoning.`;
         intent: 'UNKNOWN',
         confidence: 0,
         reasoning: 'Classification failed',
+        usage: EMPTY_USAGE,
       };
     }
   }

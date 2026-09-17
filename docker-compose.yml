@@ -20,12 +20,43 @@ services:
       - '4566:4566'
     environment:
       SERVICES: s3
-      AWS_DEFAULT_REGION: ap-south-1
+      # ✅ All values read from .env — nothing hardcoded here
+      AWS_DEFAULT_REGION: ${AWS_S3_REGION:-us-east-1}
+      AWS_S3_BUCKET: ${AWS_S3_BUCKET:-agent-fox-budget}
+      AWS_S3_WORKBOOK_KEY: ${AWS_S3_WORKBOOK_KEY:-Budget_2026.xlsx}
       DEBUG: 0
       LOCALSTACK_AUTH_TOKEN: ${LOCALSTACK_AUTH_TOKEN}
+      # ✅ Durability: persist S3 state to disk so buckets/objects survive
+      # container restarts (requires Pro token, which we pass above).
+      # The data volume below then actually preserves state across restarts.
+      PERSISTENCE: 1
     volumes:
       - agent_fox_localstack_data:/var/lib/localstack
+    healthcheck:
+      test: ["CMD", "bash", "-c", "awslocal s3 ls > /dev/null 2>&1"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+
+  redis:
+    image: redis/redis-stack:latest
+    container_name: agent-fox-redis
+    restart: unless-stopped
+    ports:
+      - '6380:6379'      # ✅ External port 6380 to avoid conflict with company Redis on 6379
+      - '8002:8001'      # ✅ RedisInsight on 8002
+    environment:
+      REDIS_ARGS: "--save 60 1 --loglevel warning"
+    volumes:
+      - agent_fox_redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
 
 volumes:
   agent_fox_postgres_data:
   agent_fox_localstack_data:
+  agent_fox_redis_data:

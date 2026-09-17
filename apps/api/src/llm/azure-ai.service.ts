@@ -7,6 +7,23 @@ import { OpenAI } from 'openai';
  * Uses OpenAI-compatible API with Azure AI Foundry project endpoint
  * Route: {project-endpoint}/openai/v1/chat/completions
  */
+/**
+ * Token usage for one LLM call. Returned alongside every structured
+ * completion so graph nodes can meter real per-request usage instead of
+ * reporting zeroes.
+ */
+export interface LlmUsage {
+  promptTokens: number;
+  completionTokens: number;
+  totalTokens: number;
+}
+
+export const EMPTY_USAGE: LlmUsage = {
+  promptTokens: 0,
+  completionTokens: 0,
+  totalTokens: 0,
+};
+
 @Injectable()
 export class AzureAIService {
   private readonly logger = new Logger(AzureAIService.name);
@@ -46,10 +63,7 @@ export class AzureAIService {
 
   /**
    * Call the LLM with structured output using JSON schema
-   * @param messages - Chat messages (OpenAI format)
-   * @param responseFormat - JSON schema for structured output
-   * @param temperature - Model temperature (default: 1 for gpt-5-mini)
-   * @returns Parsed structured response
+   * @returns Parsed response + real token usage for per-request metering
    */
   async getStructuredCompletion<T = any>(
     messages: Array<{
@@ -65,7 +79,7 @@ export class AzureAIService {
       };
     },
     temperature: number = 1,
-  ): Promise<T> {
+  ): Promise<{ data: T; usage: LlmUsage }> {
     try {
       this.logger.log(
         `Calling ${this.deployment} with ${messages.length} messages`,
@@ -84,10 +98,18 @@ export class AzureAIService {
         throw new Error('No content in LLM response');
       }
 
+      const usage: LlmUsage = {
+        promptTokens: completion.usage?.prompt_tokens || 0,
+        completionTokens: completion.usage?.completion_tokens || 0,
+        totalTokens: completion.usage?.total_tokens || 0,
+      };
+
       try {
         const parsed = JSON.parse(content);
-        this.logger.log('Structured completion received and parsed');
-        return parsed as T;
+        this.logger.log(
+          `Structured completion received and parsed (tokens: ${usage.totalTokens})`,
+        );
+        return { data: parsed as T, usage };
       } catch (parseError) {
         this.logger.error(
           `Failed to parse LLM response: ${parseError instanceof Error ? parseError.message : String(parseError)}`,

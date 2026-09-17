@@ -6,6 +6,7 @@ import { CategoryInferenceService } from './category-inference.service';
 import { EditParser } from './edit-parser.service';
 import { QueryInterpreter } from './query-interpreter.service';
 import { SchemaValidator } from './schema-validator.service';
+import { AnswerGenerator } from './answer-generator.service';
 
 /**
  * LLM Module
@@ -20,6 +21,7 @@ import { SchemaValidator } from './schema-validator.service';
     EditParser,
     QueryInterpreter,
     SchemaValidator,
+    AnswerGenerator,
   ],
   exports: [
     AzureAIService,
@@ -29,6 +31,7 @@ import { SchemaValidator } from './schema-validator.service';
     EditParser,
     QueryInterpreter,
     SchemaValidator,
+    AnswerGenerator,
   ],
 })
 export class LlmModule {}

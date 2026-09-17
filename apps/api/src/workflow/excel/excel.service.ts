@@ -8,10 +8,24 @@ import {
   WriteTransactionResult,
   ValidationResult,
   SheetRouting,
+  SheetBalances,
   PaymentMode,
   WishlistData,
 } from './excel.types';
 import { WorkbookRulesService } from './workbook-rules.service';
+
+/**
+ * Normalize a payment-mode label for comparison/grouping.
+ * Real books store variants ("Phone Pay", "PHONEPAY", blank) — all map to
+ * one canonical key so filters and breakdowns never split or drop rows.
+ * Blank/unknown becomes 'UNSPECIFIED' (shown honestly, not hidden).
+ */
+export function normalizeModeLabel(mode: unknown): string {
+  const normalized = String(mode || '')
+    .toUpperCase()
+    .replace(/[\s_-]+/g, '');
+  return normalized || 'UNSPECIFIED';
+}
 
 /**
  * Excel Service for workbook operations using ExcelJS
@@ -213,13 +227,17 @@ export class ExcelService {
       // Prepare row data
       const row = sheet.getRow(newRow);
 
+      // Book convention is all-caps descriptions — normalize at the choke
+      // point so EVERY write path (current and future) lands caps in the sheet.
+      const sheetDescription = String(tx.description || '').trim().toUpperCase();
+
       if (routing.sheetName === 'CASH TRACKER') {
         // CASH TRACKER format: B=Month, C=Date, D=Description, E=Mode, F=Debit, G=Credit, H=Money, I=Bank
         row.getCell('B').value = txDate.toLocaleString('en-US', {
           month: 'long',
         });
         row.getCell('C').value = txDate;
-        row.getCell('D').value = tx.description;
+        row.getCell('D').value = sheetDescription;
         row.getCell('E').value = tx.mode;
         row.getCell('F').value = tx.direction === 'DEBIT' ? tx.amount : null;
         row.getCell('G').value = tx.direction === 'CREDIT' ? tx.amount : null;
@@ -227,15 +245,20 @@ export class ExcelService {
       } else {
         // Month sheet format: C=Date, D=Description, E=Mode, F=Debit, G=Credit, H=PhnPe, I=Wallet
         row.getCell('C').value = txDate;
-        row.getCell('D').value = tx.description;
+        row.getCell('D').value = sheetDescription;
         row.getCell('E').value = tx.mode;
         row.getCell('F').value = tx.direction === 'DEBIT' ? tx.amount : null;
         row.getCell('G').value = tx.direction === 'CREDIT' ? tx.amount : null;
         row.getCell(routing.balanceColumn).value = newBalance;
       }
 
-      // Apply color rules
-      this.rulesService.applyRowColor(row, tx.direction, tx.colourCategory);
+      // Apply color rules (CASH TRACKER rows start at B/Month — color it too)
+      this.rulesService.applyRowColor(
+        row,
+        tx.direction,
+        tx.colourCategory,
+        routing.sheetName === 'CASH TRACKER' ? 2 : 3,
+      );
 
       // Commit row
       row.commit();
@@ -248,6 +271,14 @@ export class ExcelService {
           routing.balanceColumn,
           newBalance,
         );
+      } else {
+        // CASH TRACKER top cards (BANK/MONEY) + TERMINOLOGY CURR cards must
+        // move with every write — they are what "balance" questions read.
+        this.updateLabeledCard(sheet, tx.mode, newBalance);
+        const terminology = workbook.getWorksheet('TERMINOLOGY');
+        if (terminology) {
+          this.updateLabeledCard(terminology, `${tx.mode}[CURR]`, newBalance);
+        }
       }
 
       this.logger.log(
@@ -304,6 +335,171 @@ export class ExcelService {
   }
 
   /**
+   * Update a labeled balance card: find a cell whose text matches the label
+   * (e.g. "BANK", "MONEY", "BANK[CURR]") in the label zone and write the new
+   * balance into the cell immediately to its right.
+   *
+   * Covers CASH TRACKER top cards (C5/D5 BANK, C6/D6 MONEY) and TERMINOLOGY
+   * CURR cards (J5/K5 BANK[CURR], J6/K6 MONEY[CURR]).
+   */
+  private updateLabeledCard(
+    sheet: ExcelJS.Worksheet,
+    label: string,
+    newBalance: number,
+  ): void {
+    const wanted = label.toUpperCase().replace(/\s+/g, '');
+    const maxRow = Math.min(12, sheet.rowCount);
+    const maxCol = Math.min(16, sheet.columnCount);
+
+    for (let row = 1; row <= maxRow; row++) {
+      for (let col = 1; col <= maxCol; col++) {
+        const v = sheet.getRow(row).getCell(col).value;
+        if (typeof v !== 'string') continue;
+        if (v.toUpperCase().replace(/\s+/g, '') !== wanted) continue;
+        sheet.getRow(row).getCell(col + 1).value = newBalance;
+        this.logger.log(
+          `Updated balance card "${v}" at ${sheet.getColumn(col).letter}${row} = ${newBalance}`,
+        );
+        return;
+      }
+    }
+
+    this.logger.warn(
+      `Balance card "${label}" not found on sheet "${sheet.name}" — card not updated`,
+    );
+  }
+
+  /**
+   * Resolve LLM-requested sheet names to actual workbook sheets.
+   */
+  private resolveSheetNames(
+    workbook: ExcelJS.Workbook,
+    requested?: string[],
+  ): string[] {
+    const defaults = ['SEPTEMBER', 'CASH TRACKER'];
+
+    if (!requested || requested.length === 0) {
+      return defaults.filter((s) => workbook.getWorksheet(s));
+    }
+
+    const actual = workbook.worksheets.map((s) => s.name);
+    const resolved: string[] = [];
+
+    for (const name of requested) {
+      const cleaned = name.replace(/\s*\(.*\)\s*$/, '').trim();
+      const hit = actual.find(
+        (a) =>
+          a.toUpperCase() === cleaned.toUpperCase() ||
+          a.toUpperCase() === name.toUpperCase(),
+      );
+      if (hit) {
+        if (!resolved.includes(hit)) resolved.push(hit);
+      } else {
+        this.logger.warn(
+          `Requested sheet "${name}" does not exist (have: ${actual.join(', ')}) — skipping`,
+        );
+      }
+    }
+
+    if (resolved.length === 0) {
+      this.logger.warn(
+        'No requested sheets resolved — falling back to default sheets',
+      );
+      return defaults.filter((s) => workbook.getWorksheet(s));
+    }
+
+    return resolved;
+  }
+
+  /**
+   * Read current balances from the workbook itself.
+   *
+   * Rule (per the owner's bookkeeping): each mode's current balance is the
+   * LAST recorded running-balance value in its column — H for PhonePay (month
+   * sheets) / Money (CASH TRACKER), I for Wallet / Bank. The "current" month
+   * sheet is the one with the latest last-transaction date.
+   *
+   * This is the AUTHORITATIVE source for "balance" questions. Summing
+   * transactions is NOT equivalent (opening balances live outside the rows).
+   */
+  async getCurrentBalances(
+    workbook: ExcelJS.Workbook,
+  ): Promise<SheetBalances> {
+    const isAux = (name: string) =>
+      ['TERMINOLOGY', 'CASH TRACKER'].includes(name.toUpperCase());
+
+    let phonepay: number | null = null;
+    let wallet: number | null = null;
+    let latestMonthTime = -Infinity;
+
+    for (const sheet of workbook.worksheets) {
+      if (isAux(sheet.name)) continue;
+      // Month sheets: header row 4, C=Date, H=PhnPe Bal, I=Wallet Bal
+      const last = this.findLastDatedRow(sheet, 4, 'C');
+      if (!last) continue;
+      if (last.date.getTime() > latestMonthTime) {
+        latestMonthTime = last.date.getTime();
+        phonepay = this.lastNumericInColumn(sheet, 5, last.row, 'H');
+        wallet = this.lastNumericInColumn(sheet, 5, last.row, 'I');
+      }
+    }
+
+    const cash = workbook.getWorksheet('CASH TRACKER');
+    let money: number | null = null;
+    let bank: number | null = null;
+    if (cash) {
+      const last = this.findLastDatedRow(cash, 10, 'C');
+      if (last) {
+        money = this.lastNumericInColumn(cash, 11, last.row, 'H');
+        bank = this.lastNumericInColumn(cash, 11, last.row, 'I');
+      }
+    }
+
+    const balances = { PHONEPAY: phonepay, WALLET: wallet, MONEY: money, BANK: bank };
+    this.logger.log(`Current sheet balances: ${JSON.stringify(balances)}`);
+    return balances;
+  }
+
+  /**
+   * Last dated row at/below headerRow (date in dateColumn), or null.
+   */
+  private findLastDatedRow(
+    sheet: ExcelJS.Worksheet,
+    headerRow: number,
+    dateColumn: string,
+  ): { row: number; date: Date } | null {
+    let found: { row: number; date: Date } | null = null;
+    for (let row = headerRow + 1; row <= sheet.rowCount; row++) {
+      const v = sheet.getRow(row).getCell(dateColumn).value;
+      if (!v) continue;
+      const d = v instanceof Date ? v : new Date(String(v));
+      if (isNaN(d.getTime())) continue;
+      found = { row, date: d };
+    }
+    return found;
+  }
+
+  /**
+   * Last numeric value in column at/below fromRow scanning upward, or null.
+   */
+  private lastNumericInColumn(
+    sheet: ExcelJS.Worksheet,
+    startRow: number,
+    fromRow: number,
+    column: string,
+  ): number | null {
+    for (let row = fromRow; row >= startRow; row--) {
+      const v = sheet.getRow(row).getCell(column).value;
+      if (typeof v === 'number') return v;
+      if (v && typeof v === 'object' && 'result' in v) {
+        const n = Number((v as { result: unknown }).result);
+        if (!isNaN(n)) return n;
+      }
+    }
+    return null;
+  }
+
+  /**
    * Read transactions from workbook with optional filters
    */
   async readTransactions(
@@ -312,10 +508,15 @@ export class ExcelService {
   ): Promise<TransactionRow[]> {
     const transactions: TransactionRow[] = [];
 
-    const sheetsToRead =
-      filters?.sheets && filters.sheets.length > 0
-        ? filters.sheets
-        : ['SEPTEMBER', 'CASH TRACKER'];
+    // Resolve requested sheet names against the REAL workbook sheets.
+    // The LLM sometimes emits decorated names ("SEPTEMBER (PhonePay/Wallet)")
+    // copied from prompt prose — match case-insensitively after stripping
+    // parentheticals; drop unresolvable names with a warning instead of
+    // silently reading zero rows. If NOTHING resolves, fall back to defaults.
+    const sheetsToRead = this.resolveSheetNames(
+      workbook,
+      filters?.sheets,
+    );
 
     for (const sheetName of sheetsToRead) {
       const sheet = workbook.getWorksheet(sheetName);
@@ -330,6 +531,16 @@ export class ExcelService {
         filters,
       );
       transactions.push(...sheetTransactions);
+    }
+
+    // "Latest" support: newest-first, capped. Only when a limit was requested.
+    if (filters?.limit && filters.limit > 0) {
+      transactions.sort((a, b) => b.date.getTime() - a.date.getTime());
+      const capped = transactions.slice(0, filters.limit);
+      this.logger.log(
+        `Read ${capped.length} transactions (limited to newest ${filters.limit})`,
+      );
+      return capped;
     }
 
     this.logger.log(`Read ${transactions.length} transactions`);
@@ -435,12 +646,15 @@ export class ExcelService {
       return true;
     }
 
-    if (
-      filters.modes &&
-      filters.modes.length > 0 &&
-      !filters.modes.includes(tx.mode)
-    ) {
-      return false;
+    // Modes are stored inconsistently in real books ("Phone Pay" vs
+    // "PHONEPAY" vs blank), so compare normalized on both sides instead of
+    // strict equality — otherwise a modes:[PHONEPAY] filter silently drops
+    // half the matching rows.
+    if (filters.modes && filters.modes.length > 0) {
+      const wanted = new Set(filters.modes.map((m) => normalizeModeLabel(m)));
+      if (!wanted.has(normalizeModeLabel(tx.mode))) {
+        return false;
+      }
     }
 
     if (

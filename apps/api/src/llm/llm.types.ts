@@ -3,6 +3,15 @@
  * Defines the contract between the LLM and deterministic tools
  */
 
+import type { LlmUsage } from './azure-ai.service';
+
+/**
+ * Wraps any LLM result with the real token usage of the call that
+ * produced it, so graph nodes can meter per-request LLM cost.
+ * (azure-ai.service does NOT import this file — no import cycle.)
+ */
+export type WithUsage<T> = T & { usage: LlmUsage };
+
 // Intent Classification
 export type IntentType = 'NEW_TRANSACTION_BATCH' | 'ANALYTICAL_QUERY' | 'EDIT_OR_CONFIRM' | 'UNKNOWN';
 
@@ -81,6 +90,8 @@ export interface QueryFilter {
   tags?: string[];
   amountMin?: number;
   amountMax?: number;
+  /** Max rows newest-first ("latest transaction" → 1). */
+  limit?: number | null;
 }
 
 export interface QueryInterpretationResult {
@@ -89,6 +100,13 @@ export interface QueryInterpretationResult {
   aggregationField?: 'debit' | 'credit' | 'amount';
   chartRequested: boolean;
   chartType?: 'bar' | 'line' | 'pie';
+  /** Newest-first row cap for "latest/most recent" queries. */
+  limit?: number | null;
+  /**
+   * True for "balance / how much is there / current X balance" questions.
+   * The tool then returns authoritative sheet balances (never recomputed).
+   */
+  wantsBalances: boolean;
   reasoning: string;
 }
 
@@ -103,4 +121,14 @@ export interface AzureAIConfig {
   endpoint: string;
   apiKey: string;
   deployment: string;
+}
+
+// Answer Generation
+export interface AnswerResult {
+  /** The human-readable answer to the user's query */
+  text: string;
+  /** Whether the answer contains computed numbers / aggregations */
+  hasNumbers: boolean;
+  /** Brief reasoning for the answer (for validate_answer logic) */
+  reasoning: string;
 }

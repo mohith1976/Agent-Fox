@@ -47,7 +47,29 @@ test-results/
 # Generated Prisma client
 apps/api/src/generated/prisma
 
-# Generated documentation (kept in Knowledge/ for reference)
+# Generated documentation and temporary files
 docs/*.md
 !docs/README_CURRENT_STATUS.md
-Knowledge/*.md
+Knowledge/
+COMMIT_MESSAGE.txt
+*.xlsx
+budgetfile/*.xlsx
+
+# Test and audit files
+TEST_*.md
+AUDIT_*.md
+SPECIFICATION_*.md
+PHASE_*.md
+*_REPORT.md
+*_SUMMARY.md
+*_CHECKLIST.md
+*_READY.md
+*_COMPLETE.md
+*_FINDINGS.md
+QUICK_*.md
+WHERE_*.md
+ANALYSIS_*.md
+FIXES_*.md
+SERVERS_*.md
+system_flow.mmd
+AGENT_PROJECT_CONTEXT.md

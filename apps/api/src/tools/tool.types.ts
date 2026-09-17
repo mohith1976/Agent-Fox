@@ -1,9 +1,23 @@
 import {
   CategoryColor,
   PaymentMode,
+  SheetBalances,
   TransactionDirection,
   TransactionRow,
-} from '../excel/excel.types';
+} from '../workflow/excel/excel.types';
+
+/**
+ * Tool Definition from database (tool_definitions table)
+ */
+export interface ToolDefinition {
+  pid: string;
+  toolCode: string;
+  description: string | null; // Allow null from database
+  name: string;
+  createdAt: Date;
+  updatedAt: Date;
+  deletedAt: Date | null;
+}
 
 /**
  * Input for log_transaction tool
@@ -46,6 +60,12 @@ export interface QueryTransactionsInput {
     type: 'SUM' | 'COUNT' | 'AVERAGE';
     field: 'debit' | 'credit' | 'amount'; // 'amount' = debit OR credit
   };
+  /**
+   * When true, also read current sheet balances (last-row running balances).
+   * Used for "balance / how much is there" questions — the sheet values are
+   * authoritative and must NOT be recomputed from transactions.
+   */
+  includeBalances?: boolean;
 }
 
 /**
@@ -58,6 +78,8 @@ export interface QueryTransactionsOutput {
     count: number;
     average?: number;
   };
+  /** Present only when includeBalances was requested. */
+  balances?: SheetBalances | null;
 }
 
 /**

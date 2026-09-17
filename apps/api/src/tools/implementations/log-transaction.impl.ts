@@ -1,5 +1,5 @@
 /**
- * log_transaction_batch Tool
+ * log_transaction Tool Implementation
  * 
  * ATOMIC BATCH WRITE:
  * 1. Download workbook once
@@ -14,11 +14,12 @@
  */
 
 import { Injectable, Logger } from '@nestjs/common';
-import { S3Service } from '../storage/s3.service';
-import { ExcelService } from '../excel/excel.service';
-import { WorkbookRulesService } from '../excel/workbook-rules.service';
-import { LogTransactionInput, LogTransactionOutput } from './tools.types';
-import { NewTransactionInput } from '../excel/excel.types';
+import * as crypto from 'crypto';
+import { S3Service } from '../../workflow/storage/s3.service';
+import { ExcelService } from '../../workflow/excel/excel.service';
+import { WorkbookRulesService } from '../../workflow/excel/workbook-rules.service';
+import { LogTransactionInput, LogTransactionOutput } from '../tool.types';
+import { NewTransactionInput } from '../../workflow/excel/excel.types';
 import { Workbook } from 'exceljs';
 
 export interface BatchTransactionInput {
@@ -32,8 +33,8 @@ export interface BatchTransactionOutput {
 }
 
 @Injectable()
-export class LogTransactionBatchTool {
-  private readonly logger = new Logger(LogTransactionBatchTool.name);
+export class LogTransactionImpl {
+  private readonly logger = new Logger(LogTransactionImpl.name);
 
   constructor(
     private readonly s3Service: S3Service,
@@ -76,12 +77,12 @@ export class LogTransactionBatchTool {
     })))}`);
 
     try {
-      // STEP 1: Download workbook ONCE
+      // STEP 1: Download workbook ONCE, capturing the base-version ETag
+      // BEFORE any mutation (compare-and-swap precondition for the upload).
       this.logger.log(`[BATCH_TOOL] STEP 1 - Downloading workbook from S3, key=${s3KeyOverride || 'default'}`);
-      const workbookBuffer = await this.s3Service.downloadWorkbook(
-        s3KeyOverride,
-      );
-      this.logger.log(`[BATCH_TOOL] STEP 1 - Downloaded ${workbookBuffer.length} bytes`);
+      const { buffer: workbookBuffer, etag: baseVersionETag } =
+        await this.s3Service.downloadWithMetadata(s3KeyOverride);
+      this.logger.log(`[BATCH_TOOL] STEP 1 - Downloaded ${workbookBuffer.length} bytes (base ETag=${baseVersionETag})`);
 
       // STEP 2: Load workbook
       this.logger.log(`[BATCH_TOOL] STEP 2 - Loading workbook`);
@@ -92,6 +93,46 @@ export class LogTransactionBatchTool {
       this.logger.log(`[BATCH_TOOL] STEP 3 - Reading terminology`);
       const terminology = await this.excelService.readTerminology(workbook);
       this.logger.log(`[BATCH_TOOL] STEP 3 - Terminology loaded`);
+
+      // STEP 3b: Sufficient-balance guard — a debit batch must never drive a
+      // mode balance negative. Project per mode from the sheet's own balance
+      // cards (current + batch credits − batch debits) and refuse with a
+      // plain-language message when any mode would go below zero. Modes with
+      // no recorded balance are skipped (fail-open, never block). Refusal
+      // happens BEFORE any in-memory mutation, so nothing is persisted and
+      // the caller keeps the batch for edit/cancel.
+      this.logger.log(`[BATCH_TOOL] STEP 3b - Checking sufficient balances`);
+      const balances = await this.excelService.getCurrentBalances(workbook);
+      const netByMode: Record<string, number> = {};
+      for (const tx of input.transactions) {
+        const mode = String(tx.mode || '').toUpperCase();
+        const amt = Number(tx.amount) || 0;
+        netByMode[mode] =
+          (netByMode[mode] || 0) + (tx.direction === 'CREDIT' ? amt : -amt);
+      }
+      const shortfalls: string[] = [];
+      for (const [mode, net] of Object.entries(netByMode)) {
+        const current = (balances as unknown as Record<string, number | null>)[mode];
+        if (current === null || current === undefined) continue;
+        const projected = current + net;
+        if (projected < 0) {
+          const debitTotal = input.transactions
+            .filter(
+              (tx) =>
+                String(tx.mode || '').toUpperCase() === mode &&
+                tx.direction !== 'CREDIT',
+            )
+            .reduce((s, tx) => s + (Number(tx.amount) || 0), 0);
+          shortfalls.push(
+            `You have only ₹${current.toLocaleString('en-IN')} in ${mode} — this debit of ₹${debitTotal.toLocaleString('en-IN')} would take it to ₹${projected.toLocaleString('en-IN')}. Add a credit to ${mode} first, or pay from a different mode.`,
+          );
+        }
+      }
+      if (shortfalls.length > 0) {
+        const refusal = `${shortfalls.join(' ')} Your batch is kept — edit it (e.g. "change item 1 mode to bank") or cancel.`;
+        this.logger.warn(`[BATCH_TOOL] Batch refused: insufficient balance`);
+        return { success: false, results: [], error: refusal };
+      }
 
       // STEP 4: Apply ALL transactions deterministically in memory
       this.logger.log(`[BATCH_TOOL] STEP 4 - Applying ${input.transactions.length} transactions to workbook`);
@@ -145,26 +186,64 @@ export class LogTransactionBatchTool {
         };
       }
 
-      // STEP 6: Upload workbook ONCE
+      // STEP 6: Conditional upload ONCE (compare-and-swap).
+      // Succeeds only if the workbook still has baseVersionETag — a concurrent
+      // writer wins, we get PreconditionFailed/ConditionalRequestConflict and
+      // MUST NOT retry blindly (our in-memory mutation is based on stale data).
       this.logger.log(`[BATCH_TOOL] STEP 6 - Exporting workbook to buffer`);
       const updatedBuffer = await this.excelService.exportWorkbook(workbook);
       this.logger.log(`[BATCH_TOOL] STEP 6 - Exported ${updatedBuffer.length} bytes`);
 
-      this.logger.log(`[BATCH_TOOL] STEP 6 - Uploading to S3, key=${s3KeyOverride || 'default'}`);
+      // Expected ETag of our new content (S3 ETags are quoted MD5 for simple PUTs).
+      // Used to verify commit status if the upload times out mid-flight.
+      const expectedETag = `"${crypto.createHash('md5').update(updatedBuffer).digest('hex')}"`;
+
+      this.logger.log(`[BATCH_TOOL] STEP 6 - Conditional upload to S3, key=${s3KeyOverride || 'default'}, IfMatch=${baseVersionETag}`);
       try {
-        await this.s3Service.uploadWorkbook(updatedBuffer, s3KeyOverride);
+        await this.s3Service.uploadConditional(
+          updatedBuffer,
+          { ifMatch: baseVersionETag },
+          s3KeyOverride,
+        );
         this.logger.log(`[BATCH_TOOL] STEP 6 - Upload successful`);
       } catch (uploadError) {
-        // CRITICAL: S3 upload failed - entire batch failed
-        this.logger.error(
-          `[BATCH_TOOL] Batch write FAILED: S3 upload error: ${uploadError}`,
-        );
-        this.logger.error(`[BATCH_TOOL] Upload error stack: ${uploadError instanceof Error ? uploadError.stack : 'N/A'}`);
+        const code = (uploadError as { code?: string })?.code;
+        const message = uploadError instanceof Error ? uploadError.message : String(uploadError);
+
+        // 412/409: another writer committed first. Fail safely — caller must
+        // retry with a fresh download, never with this stale mutation.
+        if (code === 'PreconditionFailed' || code === 'ConditionalRequestConflict') {
+          this.logger.error(`[BATCH_TOOL] Batch write REJECTED by S3 concurrency guard: ${message}`);
+          return {
+            success: false,
+            results,
+            error: message,
+          };
+        }
+
+        // Timeout: unknown commit state. Verify via ETag comparison whether
+        // OUR version reached S3 before deciding committed vs failed.
+        if (code === 'S3_UPLOAD_TIMEOUT') {
+          const currentETag = await this.s3Service.headETag(s3KeyOverride);
+          if (currentETag === expectedETag) {
+            this.logger.log('[BATCH_TOOL] Upload timed out but ETag proves our version committed');
+            return { success: true, results };
+          }
+          this.logger.error('[BATCH_TOOL] Upload timeout, commit status unverifiable — failing safely');
+          return {
+            success: false,
+            results,
+            error: message,
+          };
+        }
+
+        // Other S3 errors — fail the batch, no partial state was persisted.
+        this.logger.error(`[BATCH_TOOL] Batch write FAILED: S3 upload error: ${message}`);
 
         return {
           success: false,
           results,
-          error: `S3 upload failed: ${uploadError instanceof Error ? uploadError.message : String(uploadError)}`,
+          error: `S3 upload failed: ${message}`,
         };
       }
 
@@ -241,9 +320,11 @@ export class LogTransactionBatchTool {
       }
 
       // Prepare transaction input
+      // Description is uppercased (idempotent) — the book convention is
+      // all-caps; the graph already normalizes, this is the backstop.
       const txInput: NewTransactionInput = {
         date: input.date,
-        description: input.description,
+        description: String(input.description || '').trim().toUpperCase(),
         tag: input.tag,
         mode: input.mode,
         amount: input.amount,

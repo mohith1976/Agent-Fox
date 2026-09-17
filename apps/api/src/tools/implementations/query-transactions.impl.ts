@@ -1,19 +1,19 @@
 import { Injectable, Logger } from '@nestjs/common';
-import { S3Service } from '../storage/s3.service';
-import { ExcelService } from '../excel/excel.service';
+import { S3Service } from '../../workflow/storage/s3.service';
+import { ExcelService } from '../../workflow/excel/excel.service';
 import {
   QueryTransactionsInput,
   QueryTransactionsOutput,
-} from './tools.types';
-import { TransactionRow } from '../excel/excel.types';
+} from '../tool.types';
+import { TransactionRow } from '../../workflow/excel/excel.types';
 
 /**
- * query_transactions Tool
+ * query_transactions Tool Implementation
  * Deterministic read, filter, and aggregation
  */
 @Injectable()
-export class QueryTransactionsTool {
-  private readonly logger = new Logger(QueryTransactionsTool.name);
+export class QueryTransactionsImpl {
+  private readonly logger = new Logger(QueryTransactionsImpl.name);
 
   constructor(
     private readonly s3Service: S3Service,
@@ -52,6 +52,13 @@ export class QueryTransactionsTool {
         input.filters,
       );
 
+      // Step 3b: Read authoritative sheet balances when requested
+      // ("balance" questions — never derive balances from transaction sums).
+      let balances: QueryTransactionsOutput['balances'] = null;
+      if (input.includeBalances) {
+        balances = await this.excelService.getCurrentBalances(workbook);
+      }
+
       // Step 4: Perform aggregation if requested
       let aggregation: QueryTransactionsOutput['aggregation'];
       if (input.aggregation) {
@@ -62,12 +69,13 @@ export class QueryTransactionsTool {
       }
 
       this.logger.log(
-        `Query completed: ${transactions.length} transactions, aggregation=${aggregation ? 'yes' : 'no'}`,
+        `Query completed: ${transactions.length} transactions, aggregation=${aggregation ? 'yes' : 'no'}, balances=${balances ? 'yes' : 'no'}`,
       );
 
       return {
         transactions,
         aggregation,
+        balances,
       };
     } catch (error) {
       this.logger.error(

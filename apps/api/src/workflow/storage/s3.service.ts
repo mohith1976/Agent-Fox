@@ -5,6 +5,7 @@ import {
   GetObjectCommand,
   PutObjectCommand,
   HeadBucketCommand,
+  HeadObjectCommand,
 } from '@aws-sdk/client-s3';
 
 /**
@@ -119,6 +120,143 @@ export class S3Service {
         `S3 upload failed: ${error instanceof Error ? error.message : String(error)}`,
       );
     }
+  }
+
+  /**
+   * Download the workbook WITH its S3 version (ETag).
+   * The ETag is captured BEFORE any mutation and used as the IfMatch
+   * precondition for the conditional upload (compare-and-swap).
+   */
+  async downloadWithMetadata(keyOverride?: string): Promise<{
+    buffer: Buffer;
+    etag: string;
+  }> {
+    const key = keyOverride ?? this.workbookKey;
+    const buffer = await this.downloadWorkbook(keyOverride);
+
+    const head = await this.s3Client.send(
+      new HeadObjectCommand({ Bucket: this.bucket, Key: key }),
+    );
+
+    if (!head.ETag) {
+      throw new Error('S3 HeadObject returned no ETag');
+    }
+
+    return { buffer, etag: head.ETag };
+  }
+
+  /**
+   * Conditional upload: succeeds ONLY if the S3 object still has the
+   * expected ETag (i.e. nobody modified the workbook since we downloaded it).
+   * This is the atomic compare-and-swap that prevents lost updates from
+   * concurrent writers on different threads.
+   *
+   * NOTE: IfMatch enforcement verified against the pinned dev setup
+   * (LocalStack 2026.x returns 412 PreconditionFailed on ETag mismatch).
+   * AWS S3 enforces it identically.
+   *
+   * Thrown errors carry a `code` property:
+   *  - 'PreconditionFailed' (412): stale base version, DO NOT retry blindly
+   *  - 'ConditionalRequestConflict' (409): concurrent conflicting write
+   *  - 'S3_UPLOAD_TIMEOUT': unknown commit state, MUST verify via ETag first
+   */
+  async uploadConditional(
+    buffer: Buffer,
+    options: { ifMatch: string },
+    keyOverride?: string,
+  ): Promise<void> {
+    const key = keyOverride ?? this.workbookKey;
+
+    this.logger.log(
+      `Conditional upload: ${this.bucket}/${key} (${buffer.length} bytes, IfMatch=${options.ifMatch})`,
+    );
+
+    try {
+      await this.s3Client.send(
+        new PutObjectCommand({
+          Bucket: this.bucket,
+          Key: key,
+          Body: buffer,
+          ContentType:
+            'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+          IfMatch: options.ifMatch,
+        }),
+      );
+
+      this.logger.log('Conditional upload succeeded');
+    } catch (error) {
+      throw this.classifyUploadError(error);
+    }
+  }
+
+  /**
+   * Current ETag of the workbook (for post-timeout commit verification).
+   * Returns null when the object is missing or unreadable.
+   */
+  async headETag(keyOverride?: string): Promise<string | null> {
+    const key = keyOverride ?? this.workbookKey;
+
+    try {
+      const head = await this.s3Client.send(
+        new HeadObjectCommand({ Bucket: this.bucket, Key: key }),
+      );
+      return head.ETag ?? null;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Map raw AWS SDK errors to the financial-safety error contract.
+   */
+  private classifyUploadError(error: unknown): Error {
+    const err = error as {
+      name?: string;
+      message?: string;
+      code?: string;
+      $metadata?: { httpStatusCode?: number };
+    };
+    const status = err.$metadata?.httpStatusCode;
+    const coded = new Error(
+      `S3 upload failed: ${err.message || err.name || String(error)}`,
+    ) as Error & { code?: string };
+
+    if (
+      err.name === 'PreconditionFailed' ||
+      err.code === 'PreconditionFailed' ||
+      status === 412
+    ) {
+      coded.code = 'PreconditionFailed';
+      coded.message = `PreconditionFailed: workbook modified concurrently — ${coded.message}`;
+      return coded;
+    }
+
+    if (
+      err.name === 'ConditionalRequestConflict' ||
+      err.code === 'ConditionalRequestConflict' ||
+      status === 409
+    ) {
+      coded.code = 'ConditionalRequestConflict';
+      coded.message = `ConditionalRequestConflict: concurrent conflicting write — ${coded.message}`;
+      return coded;
+    }
+
+    const message = `${err.name || ''} ${err.code || ''} ${err.message || ''}`.toLowerCase();
+    if (
+      err.name === 'TimeoutError' ||
+      err.code === 'TimeoutError' ||
+      message.includes('timeout') ||
+      message.includes('timed out') ||
+      message.includes('etimedout') ||
+      message.includes('econnreset') ||
+      message.includes('socket hang up')
+    ) {
+      coded.code = 'S3_UPLOAD_TIMEOUT';
+      coded.message = `S3_UPLOAD_TIMEOUT: unknown commit state — ${coded.message}`;
+      return coded;
+    }
+
+    return coded;
   }
 
   /**

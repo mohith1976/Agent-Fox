@@ -1,5 +1,5 @@
 import { Injectable, Logger } from '@nestjs/common';
-import { GenerateChartInput, GenerateChartOutput } from './tools.types';
+import { GenerateChartInput, GenerateChartOutput } from '../tool.types';
 import { Chart, registerables } from 'chart.js';
 import { createCanvas } from 'canvas';
 
@@ -7,12 +7,12 @@ import { createCanvas } from 'canvas';
 Chart.register(...registerables);
 
 /**
- * generate_chart Tool
+ * generate_chart Tool Implementation
  * Server-side chart rendering
  */
 @Injectable()
-export class GenerateChartTool {
-  private readonly logger = new Logger(GenerateChartTool.name);
+export class GenerateChartImpl {
+  private readonly logger = new Logger(GenerateChartImpl.name);
 
   /**
    * Execute generate_chart

@@ -22,13 +22,9 @@ const CACHE_TTL_HOURS = 24;
 @Injectable()
 export class IdempotencyService {
   private readonly logger = new Logger(IdempotencyService.name);
-  private readonly EXPENSE_WORKFLOW_ID = process.env.EXPENSE_WORKFLOW_ID!;
 
   constructor(private readonly prisma: PrismaService) {
-    this.logger.log(`IdempotencyService initialized with expense workflow ID: ${this.EXPENSE_WORKFLOW_ID}`);
-    if (!this.EXPENSE_WORKFLOW_ID) {
-      throw new Error('EXPENSE_WORKFLOW_ID not found in environment');
-    }
+    this.logger.log('IdempotencyService initialized');
   }
 
   /**
@@ -101,6 +97,7 @@ export class IdempotencyService {
    */
   async getCachedResponse(
     requestId: string,
+    workflowId: string,
   ): Promise<ChatResponseDto | null> {
     try {
       const cutoffTime = new Date();
@@ -108,7 +105,7 @@ export class IdempotencyService {
 
       const record = await this.prisma.flowTracking.findFirst({
         where: {
-          workflowId: this.EXPENSE_WORKFLOW_ID,
+          workflowId: workflowId,
           status: 'idempotency_cache',
           data: {
             path: ['requestId'],
@@ -178,6 +175,7 @@ export class IdempotencyService {
   async cacheResponse(
     requestId: string,
     response: ChatResponseDto,
+    workflowId: string,
   ): Promise<void> {
     try {
       // Normalize response before caching
@@ -209,7 +207,7 @@ export class IdempotencyService {
 
       await this.prisma.flowTracking.create({
         data: {
-          workflowId: this.EXPENSE_WORKFLOW_ID,
+          workflowId: workflowId,
           status: 'idempotency_cache',
           data: JSON.parse(JSON.stringify({
             requestId,
@@ -242,14 +240,14 @@ export class IdempotencyService {
    * Check if a request has been processed (for write operations)
    * This is used for additional safety beyond response caching
    */
-  async hasBeenProcessed(requestId: string): Promise<boolean> {
+  async hasBeenProcessed(requestId: string, workflowId: string): Promise<boolean> {
     try {
       const cutoffTime = new Date();
       cutoffTime.setHours(cutoffTime.getHours() - CACHE_TTL_HOURS);
 
       const count = await this.prisma.flowTracking.count({
         where: {
-          workflowId: this.EXPENSE_WORKFLOW_ID,
+          workflowId: workflowId,
           status: 'idempotency_cache',
           data: {
             path: ['requestId'],
@@ -275,14 +273,14 @@ export class IdempotencyService {
    * Cleanup old cached responses (maintenance)
    * Can be called periodically to prevent unbounded growth
    */
-  async cleanup(olderThanHours: number = 72): Promise<number> {
+  async cleanup(workflowId: string, olderThanHours: number = 72): Promise<number> {
     try {
       const cutoffDate = new Date();
       cutoffDate.setHours(cutoffDate.getHours() - olderThanHours);
 
       const result = await this.prisma.flowTracking.updateMany({
         where: {
-          workflowId: this.EXPENSE_WORKFLOW_ID,
+          workflowId: workflowId,
           status: 'idempotency_cache',
           createdAt: {
             lt: cutoffDate,

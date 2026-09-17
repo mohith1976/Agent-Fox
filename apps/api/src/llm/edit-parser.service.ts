@@ -1,6 +1,10 @@
 import { Injectable, Logger } from '@nestjs/common';
-import { AzureAIService } from './azure-ai.service';
-import { EditParseResult, EditInstruction } from './llm.types';
+import { AzureAIService, EMPTY_USAGE } from './azure-ai.service';
+import { EditParseResult, EditInstruction, WithUsage } from './llm.types';
+import {
+  getEditParserSystemPrompt,
+  EDIT_PARSE_SCHEMA,
+} from './prompts/edit-parser.prompts';
 
 /**
  * Edit Parser
@@ -21,36 +25,12 @@ export class EditParser {
   async parse(
     userMessage: string,
     pendingBatch: any[],
-  ): Promise<EditParseResult> {
+  ): Promise<WithUsage<EditParseResult>> {
     this.logger.log(
       `Parsing edit/confirm for: "${userMessage}" (${pendingBatch.length} items in batch)`,
     );
 
-    const systemPrompt = `You are an edit instruction parser for a transaction review system.
-
-The user is reviewing a numbered list of pending transactions and can:
-1. Confirm the batch: "confirm", "yes", "ok", "looks good", etc.
-2. Edit specific items by number: "edit item 2 amount to 500", "change item 1 description to restaurant", "item 3 mode wallet"
-
-Available fields for editing:
-- description: Text description
-- amount: Numeric value
-- mode: PHONEPAY, WALLET, MONEY, or BANK
-- category: AVOID_EXPENSE, PAY_HOME_CASH, PERSONAL_EXPENSE, HOME_EXPENSE, WISHLIST_EXPENSE, or null
-- tag: Free text tag
-
-Parse the user's message and determine:
-1. Is this a confirmation (approve the batch)?
-2. Are there any edit instructions?
-
-For edits, extract:
-- itemNumber: The item number being edited (1-indexed)
-- field: Which field to edit
-- newValue: The new value (as string for description/tag/mode/category, number for amount)
-
-If the instruction is unclear or refers to non-existent items, set needsClarification to true.
-
-Current batch has ${pendingBatch.length} items (numbered 1 to ${pendingBatch.length}).`;
+    const systemPrompt = getEditParserSystemPrompt(pendingBatch.length);
 
     const messages: Array<{
       role: 'system' | 'user' | 'assistant';
@@ -66,51 +46,8 @@ Current batch has ${pendingBatch.length} items (numbered 1 to ${pendingBatch.len
       },
     ];
 
-    const schema = {
-      type: 'object' as const,
-      properties: {
-        isConfirmation: {
-          type: 'boolean' as const,
-        },
-        edits: {
-          type: 'array' as const,
-          items: {
-            type: 'object' as const,
-            properties: {
-              itemNumber: {
-                type: 'number' as const,
-                minimum: 1,
-              },
-              field: {
-                type: 'string' as const,
-                enum: ['description', 'amount', 'mode', 'category', 'tag'],
-              },
-              newValue: {
-                type: ['string', 'number'] as any,
-              },
-            },
-            required: ['itemNumber', 'field', 'newValue'],
-            additionalProperties: false,
-          },
-        },
-        needsClarification: {
-          type: 'boolean' as const,
-        },
-        clarificationMessage: {
-          type: 'string' as const,
-        },
-      },
-      required: [
-        'isConfirmation',
-        'edits',
-        'needsClarification',
-        'clarificationMessage',
-      ],
-      additionalProperties: false,
-    };
-
     try {
-      const result =
+      const { data: result, usage } =
         await this.azureAI.getStructuredCompletion<EditParseResult>(
           messages,
           {
@@ -118,7 +55,7 @@ Current batch has ${pendingBatch.length} items (numbered 1 to ${pendingBatch.len
             json_schema: {
               name: 'edit_parse',
               strict: true,
-              schema,
+              schema: EDIT_PARSE_SCHEMA,
             },
           },
           1, // gpt-5-mini requires temperature=1
@@ -139,10 +76,11 @@ Current batch has ${pendingBatch.length} items (numbered 1 to ${pendingBatch.len
           edits: [],
           needsClarification: true,
           clarificationMessage: `Invalid item numbers: ${invalidEdits.map((e) => e.itemNumber).join(', ')}. Batch has ${pendingBatch.length} items.`,
+          usage,
         };
       }
 
-      return result;
+      return { ...result, usage };
     } catch (error) {
       this.logger.error(
         `Edit parsing failed: ${error instanceof Error ? error.message : String(error)}`,
@@ -152,6 +90,7 @@ Current batch has ${pendingBatch.length} items (numbered 1 to ${pendingBatch.len
         edits: [],
         needsClarification: true,
         clarificationMessage: 'Could not understand your instruction',
+        usage: EMPTY_USAGE,
       };
     }
   }

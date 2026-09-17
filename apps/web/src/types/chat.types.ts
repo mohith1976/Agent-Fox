@@ -8,6 +8,7 @@ export interface ChatRequest {
   requestId: string;
   threadId: string;
   message: string;
+  triggerCode: string;
 }
 
 export interface PendingTransaction {
@@ -19,6 +20,9 @@ export interface PendingTransaction {
   amount: number;
   direction: string;
   suggestedCategory: string | null;
+  /** Category fields as carried by the backend (all optional, any may hold it) */
+  category?: string | null;
+  colourCategory?: string | null;
 }
 
 export interface ChatResponse {

@@ -1,8 +1,8 @@
 /**
  * Chat Controller
  * 
- * Exposes the Phase 4 API contract for the React frontend.
- * Handles chat requests with idempotency support.
+ * Exposes the API contract for the React frontend.
+ * Handles chat requests with idempotency support and state recovery.
  */
 
 import {
@@ -10,14 +10,18 @@ import {
   Post,
   Get,
   Body,
+  Param,
   Res,
+  Req,
   HttpCode,
   HttpStatus,
   Logger,
   BadRequestException,
+  HttpException,
 } from '@nestjs/common';
-import type { Response } from 'express';
-import { ExpenseWorkflowService } from '../expense/expense-workflow.service';
+import type { Request, Response } from 'express';
+import { WorkflowService } from '../workflow.service';
+import { WorkflowRegistryService } from '../workflow-registry.service';
 import { IdempotencyService } from './idempotency.service';
 import { S3Service } from '../storage/s3.service';
 
@@ -33,6 +37,9 @@ export interface ChatRequestDto {
 
   /** User message */
   message: string;
+
+  /** Workflow trigger code (e.g., 'expense_workflow') */
+  triggerCode: string;
 }
 
 /**
@@ -87,7 +94,8 @@ export class ChatController {
   private readonly logger = new Logger(ChatController.name);
 
   constructor(
-    private readonly workflowService: ExpenseWorkflowService,
+    private readonly workflowService: WorkflowService,
+    private readonly workflowRegistry: WorkflowRegistryService,
     private readonly idempotencyService: IdempotencyService,
     private readonly s3Service: S3Service,
   ) {
@@ -97,8 +105,9 @@ export class ChatController {
   /**
    * POST /api/chat
    * 
-   * Execute the expense workflow for a user message.
+   * Execute workflow for a user message.
    * Supports idempotency via requestId.
+   * Routes to appropriate workflow via triggerCode.
    */
   @Post()
   @HttpCode(HttpStatus.OK)
@@ -106,20 +115,49 @@ export class ChatController {
     const startTime = Date.now();
 
     // Validate request
-    if (!request.requestId || !request.threadId || !request.message) {
+    if (!request.requestId || !request.threadId || !request.message || !request.triggerCode) {
       throw new BadRequestException(
-        'requestId, threadId, and message are required',
+        'requestId, threadId, message, and triggerCode are required',
       );
     }
 
     this.logger.log(
-      `[POST /api/chat] thread=${request.threadId}, request=${request.requestId}, message="${request.message.substring(0, 50)}..."`,
+      `[POST /api/chat] thread=${request.threadId}, request=${request.requestId}, trigger=${request.triggerCode}, message="${request.message.substring(0, 50)}..."`,
     );
 
     try {
+      // STEP 0a: STOP interception at the request boundary (BEFORE LangGraph).
+      // Exact keyword only — "stop buying groceries" etc. are normal messages.
+      // Never creates FlowTracking, never invokes the graph, never touches checkpoints.
+      if (request.message.trim().toLowerCase() === 'stop') {
+        const { stopped } = await this.workflowService.requestStop(
+          request.threadId,
+          request.triggerCode,
+        );
+
+        this.logger.log(
+          `[POST /api/chat] STOP for thread=${request.threadId}: ${stopped ? 'session ended' : 'no active execution'}`,
+        );
+
+        return {
+          success: true,
+          response: stopped ? 'Flow stopped.' : 'No flow is currently running.',
+          workflowMode: 'IDLE',
+          cached: false,
+        };
+      }
+
+      // STEP 0b: Look up workflow from database using triggerCode
+      const workflow = await this.workflowRegistry.findByTriggerCode(request.triggerCode);
+      const workflowId = workflow.id;
+
+      this.logger.log(
+        `[POST /api/chat] resolved workflow: id=${workflowId}, name=${workflow.name}`,
+      );
+
       // STEP 1: Check idempotency cache FIRST (before acquiring lock)
       const cachedResponse =
-        await this.idempotencyService.getCachedResponse(request.requestId);
+        await this.idempotencyService.getCachedResponse(request.requestId, workflowId);
 
       if (cachedResponse) {
         this.logger.log(
@@ -146,12 +184,14 @@ export class ChatController {
         // Another request is processing this requestId - wait for it to complete
         this.logger.log(`[POST /api/chat] request=${request.requestId} is being processed by another request, polling for cache...`);
         
-        // Poll for cached response (the other request will cache it)
-        // Keep polling for up to 60 seconds (enough for most workflows)
-        for (let attempt = 0; attempt < 300; attempt++) {
-          await new Promise(resolve => setTimeout(resolve, 200)); // Wait 200ms
+        // Poll for cached response (the other request will cache it).
+        // Bounded with linear backoff: up to ~30s total, then fail fast
+        // instead of hammering PostgreSQL with 300 fixed-interval queries.
+        const MAX_POLL_ATTEMPTS = 30;
+        for (let attempt = 0; attempt < MAX_POLL_ATTEMPTS; attempt++) {
+          await new Promise(resolve => setTimeout(resolve, 200 + attempt * 100));
           
-          const cachedAfterWait = await this.idempotencyService.getCachedResponse(request.requestId);
+          const cachedAfterWait = await this.idempotencyService.getCachedResponse(request.requestId, workflowId);
           if (cachedAfterWait) {
             this.logger.log(`[POST /api/chat] found cached response after waiting (attempt ${attempt + 1})`);
             
@@ -168,15 +208,15 @@ export class ChatController {
           }
         }
         
-        // Timeout after 60s - this should never happen in practice
-        this.logger.error(`[POST /api/chat] timeout after 60s waiting for cached response for request=${request.requestId}`);
+        // Bounded wait exhausted — fail fast so the client can retry with a new requestId
+        this.logger.error(`[POST /api/chat] timeout waiting for cached response for request=${request.requestId}`);
         throw new Error('Request timeout: another instance is still processing this request');
       }
 
       try {
         // STEP 3: Double-check cache (in case we won the race after lock)
         const cachedAfterLock =
-          await this.idempotencyService.getCachedResponse(request.requestId);
+          await this.idempotencyService.getCachedResponse(request.requestId, workflowId);
 
         if (cachedAfterLock) {
           this.logger.log(
@@ -195,49 +235,40 @@ export class ChatController {
           };
         }
 
-        // STEP 4: Execute workflow
+        // STEP 4: Execute workflow via WorkflowService
         const result = await this.workflowService.execute({
-          requestId: request.requestId,
-          threadId: request.threadId,
+          triggerCode: request.triggerCode,
           message: request.message,
+          threadId: request.threadId,
+          requestId: request.requestId,
         });
 
         const executionTimeMs = Date.now() - startTime;
 
-        // Normalize pendingBatch to ensure consistent key ordering
-        const normalizedPendingBatch = result.pendingBatch ? result.pendingBatch.map(tx => ({
-          itemNumber: tx.itemNumber,
-          date: tx.date,
-          description: tx.description,
-          tag: tx.tag,
-          mode: tx.mode,
-          amount: tx.amount,
-          direction: tx.direction,
-          suggestedCategory: tx.suggestedCategory,
-        })) : null;
-
+        // Map WorkflowService result to ChatResponseDto
+        // llmCalls/toolCalls are MEASURED graph-state counters (never estimates).
         const response: ChatResponseDto = {
-          success: result.success,
-          response: result.response,
-          pendingBatch: normalizedPendingBatch,
-          chartImage: result.chartImage,
-          error: result.error,
-          workflowMode: result.workflowMode,
+          success: result.status === 'completed',
+          response: result.result?.lastResponse || result.error || 'No response',
+          pendingBatch: result.result?.pendingBatch || null,
+          chartImage: result.result?.chartImage || null,
+          error: result.error || null,
+          workflowMode: result.result?.workflowMode || 'IDLE',
           cached: false,
           metadata: {
-            llmCalls: result.metadata?.llmCalls,
-            toolCalls: result.metadata?.toolCalls,
+            llmCalls: result.result?.metadata?.llmCalls || 0,
+            toolCalls: result.result?.metadata?.toolCalls || 0,
             executionTimeMs,
           },
         };
 
         // STEP 5: Cache successful responses for idempotency
-        if (result.success) {
-          await this.idempotencyService.cacheResponse(request.requestId, response);
+        if (result.status === 'completed') {
+          await this.idempotencyService.cacheResponse(request.requestId, response, workflowId);
         }
 
         this.logger.log(
-          `[POST /api/chat] completed in ${executionTimeMs}ms, success=${result.success}, mode=${result.workflowMode}`,
+          `[POST /api/chat] completed in ${executionTimeMs}ms, status=${result.status}, mode=${response.workflowMode}`,
         );
 
         return response;
@@ -268,14 +299,56 @@ export class ChatController {
   }
 
   /**
+   * GET /api/chat/state/:threadId
+   * 
+   * Recover conversation state for a thread.
+   * Used by frontend on mount/refresh to restore pending batches and conversation state.
+   */
+  @Get('state/:threadId')
+  @HttpCode(HttpStatus.OK)
+  async getState(@Param('threadId') threadId: string): Promise<{
+    messages: any[];
+    pendingBatch: any | null;
+    lastResponse: string;
+    status: string;
+  }> {
+    this.logger.log(`[GET /api/chat/state/:threadId] Recovering state for thread=${threadId}`);
+
+    try {
+      const state = await this.workflowService.recoverState(threadId);
+
+      this.logger.log(
+        `[GET /api/chat/state/:threadId] Recovered state: status=${state.status}, hasPending=${!!state.pendingBatch}`,
+      );
+
+      return state;
+    } catch (error) {
+      this.logger.error(
+        `[GET /api/chat/state/:threadId] Failed to recover state: ${error instanceof Error ? error.message : String(error)}`,
+      );
+
+      // Return empty state on error
+      return {
+        messages: [],
+        pendingBatch: null,
+        lastResponse: '',
+        status: 'idle',
+      };
+    }
+  }
+
+  /**
    * GET /api/chat/health
    * 
    * Health check endpoint
    */
   @Post('health')
   @HttpCode(HttpStatus.OK)
-  async health(): Promise<{ status: string; workflow: string }> {
-    return this.workflowService.healthCheck();
+  async health(): Promise<{ status: string; service: string }> {
+    return {
+      status: 'ok',
+      service: 'chat-controller',
+    };
   }
 
   /**
@@ -305,6 +378,55 @@ export class ChatController {
         error: 'Failed to download workbook',
         message: errorMessage,
       });
+    }
+  }
+
+  /**
+   * POST /api/chat/upload-workbook
+   * 
+   * Upload Budget_2026.xlsx to S3 (replaces existing file)
+   */
+  @Post('upload-workbook')
+  @HttpCode(HttpStatus.OK)
+  async uploadWorkbook(@Req() req: Request): Promise<{ success: boolean; message: string; filename: string }> {
+    try {
+      this.logger.log('[POST /api/chat/upload-workbook] Starting upload');
+
+      // Read file buffer from request body
+      const chunks: Buffer[] = [];
+      for await (const chunk of req as any) {
+        chunks.push(Buffer.from(chunk));
+      }
+      const fileBuffer = Buffer.concat(chunks);
+
+      if (fileBuffer.length === 0) {
+        throw new HttpException('Empty file uploaded', HttpStatus.BAD_REQUEST);
+      }
+
+      this.logger.log(`[POST /api/chat/upload-workbook] File size: ${fileBuffer.length} bytes`);
+
+      // Upload to S3 (replaces existing file - same key)
+      await this.s3Service.uploadWorkbook(fileBuffer);
+
+      this.logger.log('[POST /api/chat/upload-workbook] Upload successful');
+
+      return {
+        success: true,
+        message: 'Workbook uploaded and replaced successfully',
+        filename: 'Budget_2026.xlsx',
+      };
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+      this.logger.error(`[POST /api/chat/upload-workbook] Error: ${errorMessage}`);
+
+      if (error instanceof HttpException) {
+        throw error;
+      }
+
+      throw new HttpException(
+        'Failed to upload workbook',
+        HttpStatus.INTERNAL_SERVER_ERROR,
+      );
     }
   }
 }
