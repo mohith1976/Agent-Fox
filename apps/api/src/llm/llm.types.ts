@@ -19,6 +19,8 @@ export interface IntentClassificationResult {
   intent: IntentType;
   confidence: number;
   reasoning?: string;
+  /** Segmented sub-requests for combinational turns (absent = single). */
+  subRequests?: Array<{ text: string; intent: string }>;
 }
 
 // Transaction Extraction

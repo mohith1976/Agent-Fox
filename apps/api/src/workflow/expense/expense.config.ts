@@ -45,6 +45,21 @@ export const EXPENSE_CONFIG = {
    * Try generating answer multiple times for quality
    */
   MAX_ANSWER_REGENERATIONS: 2,
+
+  /**
+   * Maximum rows a row-detail answer must enumerate before the totals-only
+   * fallback applies. Above this, demanding every description in the reply
+   * costs more context than it is worth — totals plus the row window win.
+   * Mirrors the answer service's serialized row window for detail queries.
+   */
+  MAX_ROW_ENUMERATION: 50,
+
+  /**
+   * Maximum sub-requests processed per combinational turn. Beyond this,
+   * extra sub-texts are folded into the last sub (still answered, jointly)
+   * so per-turn LLM fan-out stays bounded and no user content is dropped.
+   */
+  MAX_COMBO_SUBS: 4,
   
   // ========================================
   // INFRASTRUCTURE RETRIES (AUTOMATIC)

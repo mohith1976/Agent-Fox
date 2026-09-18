@@ -45,9 +45,15 @@ export class AnswerGenerator {
     balances?: Record<string, number | null> | null;
     /** Modes the user asked about (null/empty = all). Scopes the mandatory lead sentence. */
     balanceModes?: string[] | null;
+    /** Row details requested: enumerate rows, not just totals. */
+    details?: boolean | null;
+    /** Deterministic column scope ('descriptions-only' or null). */
+    detailScope?: string | null;
+    /** Max rows serialized for the LLM (nodes own this bound; default 20). */
+    maxRows?: number | null;
   }): Promise<WithUsage<AnswerResult>> {
     this.logger.log(
-      `Generating answer for intent "${input.queryIntent}" with ${input.count} transactions`,
+      `Generating answer for intent "${input.queryIntent}" with ${input.count} transactions (details=${!!input.details}, scope=${input.detailScope || 'full'})`,
     );
 
     const systemPrompt = getAnswerGeneratorSystemPrompt(input.workflowPrompt);
@@ -59,6 +65,9 @@ export class AnswerGenerator {
       input.note,
       input.balances,
       input.balanceModes,
+      !!input.details,
+      input.maxRows ?? 20,
+      input.detailScope || null,
     );
 
     return this.callLLM(systemPrompt, userContent, 'generate');
@@ -83,6 +92,9 @@ export class AnswerGenerator {
     note?: string | null;
     balances?: Record<string, number | null> | null;
     balanceModes?: string[] | null;
+    details?: boolean | null;
+    detailScope?: string | null;
+    maxRows?: number | null;
   }): Promise<WithUsage<AnswerResult>> {
     this.logger.log(
       `Regenerating answer for intent "${input.queryIntent}" — reason: ${input.feedback}`,
@@ -90,10 +102,14 @@ export class AnswerGenerator {
 
     const systemPrompt = getAnswerRegeneratorSystemPrompt(input.workflowPrompt);
 
+    // Forward instruction, never backward criticism: quoting the failed draft
+    // plus a "Feedback:" memo gives the model backstage text to acknowledge
+    // ("The previous answer failed…", "An omission occurred…"), which then
+    // leaks into the reply. The requirements carry the same signal with
+    // nothing to parrot.
     const userContent =
-      `Previous answer (unsatisfactory): "${input.previousAnswer}"\n` +
-      `Feedback: ${input.feedback}\n\n` +
-      buildUserContent(input.transactions, input.queryIntent, input.transactions.length, input.note, input.balances, input.balanceModes);
+      `Requirements for this answer: ${input.feedback}\n\n` +
+      buildUserContent(input.transactions, input.queryIntent, input.transactions.length, input.note, input.balances, input.balanceModes, !!input.details, input.maxRows ?? 20, input.detailScope || null);
 
     return this.callLLM(systemPrompt, userContent, 'regenerate');
   }
@@ -151,6 +167,9 @@ function buildUserContent(
   note?: string | null,
   balances?: Record<string, number | null> | null,
   balanceModes?: string[] | null,
+  details?: boolean,
+  maxRows?: number,
+  detailScope?: string | null,
 ): string {
   // Balances outrank row counts: a balance question with zero retrieved rows
   // still has an authoritative answer from the sheet last-rows.
@@ -178,8 +197,10 @@ function buildUserContent(
   // Net position (credit − debit). "Balance" questions MUST lead with this.
   const net = totalCredit - totalDebit;
 
-  // Summarize top entries (cap at 20 to stay within context)
-  const sample = transactions.slice(0, 20).map((t) => ({
+  // Summarize entries for the LLM. Row-detail answers need the actual rows
+  // (capped by the caller-owned bound); totals answers need only a sample.
+  const rowCap = Math.max(1, maxRows ?? 20);
+  const sample = transactions.slice(0, rowCap).map((t) => ({
     date: t.date,
     description: t.description,
     amount: t.debit || t.credit || t.amount,
@@ -208,16 +229,38 @@ function buildUserContent(
       `- ${mode}: debit ₹${m.debit.toLocaleString('en-IN')} / credit ₹${m.credit.toLocaleString('en-IN')} across ${m.count} transaction(s)`,
   );
 
+  // Balance-only payloads relabel the intent: "Query intent: SUM" with no
+  // data attached reads as a broken retrieval and the model confabulates
+  // about missing rows ("I don't see any transaction rows…"). BALANCE states
+  // what the turn actually is.
+  const balanceOnly = !!balances && !details;
+  const intentLabel = balanceOnly ? 'BALANCE' : queryIntent;
   return (
-    `Query intent: ${queryIntent}\n` +
+    `Query intent: ${intentLabel}\n` +
     (balances ? `${mandatoryBalanceLead(balances, balanceModes)}\n` : '') +
-    `Total transactions: ${count}\n` +
-    `Total debit: ₹${totalDebit.toLocaleString('en-IN')}\n` +
-    `Total credit: ₹${totalCredit.toLocaleString('en-IN')}\n` +
-    `Net position (total credit − total debit): ₹${net.toLocaleString('en-IN')}\n` +
-    `Per-mode breakdown (report these exact numbers, grouped by mode):\n${modeLines.join('\n')}\n` +
-    (note ? `Retrieval note (disclose this briefly in the answer): ${note}\n` : '') +
-    `Transactions (up to 20 shown):\n${JSON.stringify(sample, null, 2)}`
+    (details && count > 0
+      ? detailScope === 'descriptions-only'
+        ? `OUTPUT COLUMNS: descriptions only — list one description per line and NOTHING else (no dates, amounts, modes, totals, or breakdowns).\n`
+        : `ROW DETAILS REQUESTED — narrate conversationally ("You spent ₹X on A, ₹Y on B…"): fuse EACH row into ONE clause with exact figures, each fact stated ONCE (no verbatim echo plus paraphrase, no "(mode: X)"/date tags for facts the description or shared context already carries). A bare scraped list is NOT an acceptable answer here; totals alone are NOT an acceptable answer here.\n`
+      : '') +
+    // Balance-ONLY questions are answered from the lead sentence above — row
+    // totals, breakdowns and samples are withheld so the answer stays
+    // balances-only (a 43-row dump after "your balances" is the bug), and no
+    // counts are mentioned either (any scope chatter invites confabulation
+    // about missing rows). OUTPUT is the balance sentence(s), verbatim.
+    // NOT unconditional: when row details were ALSO asked (combined
+    // question), the full content below applies — answering only the balance
+    // half drops half the query.
+    (balances && !details
+      ? `OUTPUT: reply with ONLY the balance sentence(s) above, exactly as written. No totals, no rows, no commentary about transactions.\n` +
+        (note ? `Retrieval note (disclose this briefly in the answer): ${note}\n` : '')
+      : `Total transactions: ${count}\n` +
+        `Total debit: ₹${totalDebit.toLocaleString('en-IN')}\n` +
+        `Total credit: ₹${totalCredit.toLocaleString('en-IN')}\n` +
+        `Net position (total credit − total debit): ₹${net.toLocaleString('en-IN')}\n` +
+        `Per-mode breakdown (report these exact numbers, grouped by mode):\n${modeLines.join('\n')}\n` +
+        (note ? `Retrieval note (disclose this briefly in the answer): ${note}\n` : '') +
+        `Row data:\n${JSON.stringify(sample, null, 2)}`)
   );
 }
 

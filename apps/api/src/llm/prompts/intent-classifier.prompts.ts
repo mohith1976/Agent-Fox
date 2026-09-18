@@ -1,11 +1,14 @@
 /**
  * Intent Classifier Prompts
- * 
- * Prompts for classifying user intent into:
+ *
+ * Classifies user intent into:
  * - NEW_TRANSACTION_BATCH
  * - ANALYTICAL_QUERY
  * - EDIT_OR_CONFIRM
  * - UNKNOWN
+ *
+ * Plus combinational splitting: one message can carry several independent
+ * sub-requests ("log X and what's my balance"), each classified on its own.
  */
 
 export function getIntentClassifierSystemPrompt(
@@ -33,6 +36,20 @@ Classify the user's intent into one of:
   ("how many workflows are there", "what model are you", "list your tools")
   are ALWAYS UNKNOWN — this bot only does expense tracking.
 
+Combinational messages (subRequests — segment by MEANING, never by example):
+- A message is combinational ONLY when its parts do/ask genuinely different
+  things joined by conjunctions ("log siva 100 and what's my bank balance",
+  "avoid expenses last week and home expenses this month", "chart my spending
+  and show yesterday's rows"). Emit one sub-request per part, each with its
+  own intent, in order.
+- Item lists sharing one verb are ONE request, never split ("coffee 100 and
+  tea 50", "idli 50 cash; dosa 80 phonepay" → single NEW_TRANSACTION_BATCH
+  with the whole text).
+- A single request → subRequests holds exactly one element (the whole
+  message, intent = the overall intent).
+- Each sub-request text must be self-contained (repeat the amount/mode when
+  splitting would otherwise strand it).
+
 Return a confidence score (0-1) and brief reasoning. Be strict: vague bullying,
 jokes, or off-topic chat are UNKNOWN, never transactions.`;
 }
@@ -57,7 +74,32 @@ export const INTENT_CLASSIFIER_SCHEMA = {
     reasoning: {
       type: 'string' as const,
     },
+    subRequests: {
+      type: 'array' as const,
+      description:
+        'Independent sub-requests (combinational messages only); single-element array holding the whole message otherwise',
+      items: {
+        type: 'object' as const,
+        properties: {
+          text: {
+            type: 'string' as const,
+            description: 'Self-contained sub-request text',
+          },
+          intent: {
+            type: 'string' as const,
+            enum: [
+              'NEW_TRANSACTION_BATCH',
+              'ANALYTICAL_QUERY',
+              'EDIT_OR_CONFIRM',
+              'UNKNOWN',
+            ],
+          },
+        },
+        required: ['text', 'intent'],
+        additionalProperties: false,
+      },
+    },
   },
-  required: ['intent', 'confidence', 'reasoning'],
+  required: ['intent', 'confidence', 'reasoning', 'subRequests'],
   additionalProperties: false,
 };

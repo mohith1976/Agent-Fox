@@ -58,7 +58,16 @@ Balance questions (read sheet balances, NEVER transaction sums):
   there in bank", "how much there at present" → wantsBalances: true.
 - Keep the mode filter when a mode is named (BANK for "bank balance").
 - Do NOT narrow by date unless the user states a period ("current" = all-time).
-- Aggregation still SUM (totals accompany the balances for context).
+
+Row-detail requests (the user wants to SEE the rows, not just sums):
+- The query asks to list, show, describe, mention or enumerate individual
+  transactions ("what are my transactions", "mention with descriptions",
+  "show each expense", "describe them", "list today's spending") →
+  wantsDetails: true.
+- Pure how-much / how-many / average / balance questions leave it false
+  (a totals answer is what was asked).
+- wantsDetails never changes filters or aggregation — it only shapes how
+  the answer is presented.
 
 Aggregation types: SUM, COUNT, AVERAGE
 Aggregation fields: debit, credit, amount
@@ -162,6 +171,11 @@ export const QUERY_INTERPRETATION_SCHEMA = {
       description:
         'True for balance/how-much-is-there questions; sheet balances are returned authoritatively',
     },
+    wantsDetails: {
+      type: 'boolean' as const,
+      description:
+        'True when the query asks to see/list/describe individual transactions; the answer enumerates rows, not just totals',
+    },
     reasoning: {
       type: 'string' as const,
     },
@@ -174,6 +188,7 @@ export const QUERY_INTERPRETATION_SCHEMA = {
     'chartType',
     'limit',
     'wantsBalances',
+    'wantsDetails',
     'reasoning',
   ],
   additionalProperties: false,

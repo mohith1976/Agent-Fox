@@ -62,6 +62,7 @@ export class IntentClassifier {
           intent: IntentType;
           confidence: number;
           reasoning: string;
+          subRequests?: Array<{ text: string; intent: string }>;
         }>(
           messages,
           {
@@ -76,7 +77,7 @@ export class IntentClassifier {
         );
 
       this.logger.log(
-        `Intent classified: ${result.intent} (confidence: ${result.confidence})`,
+        `Intent classified: ${result.intent} (confidence: ${result.confidence}, subs: ${(result.subRequests || []).length})`,
       );
 
       return { ...result, usage };
@@ -89,6 +90,7 @@ export class IntentClassifier {
         intent: 'UNKNOWN',
         confidence: 0,
         reasoning: 'Classification failed',
+        subRequests: [],
         usage: EMPTY_USAGE,
       };
     }

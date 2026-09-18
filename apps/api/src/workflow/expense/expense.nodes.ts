@@ -1,5 +1,5 @@
 import { Logger } from '@nestjs/common';
-import { ExpenseWorkflowState, type ExpenseWorkflowStateType, WorkflowMode } from './expense.state';
+import { ExpenseWorkflowState, type ExpenseWorkflowStateType, WorkflowMode, IntentType } from './expense.state';
 import { EXPENSE_CONFIG } from './expense.config';
 import { EMPTY_USAGE, type LlmUsage } from '../../llm/azure-ai.service';
 import { normalizeModeLabel } from '../excel/excel.service';
@@ -93,9 +93,61 @@ export function createExpenseNodes(deps: {
       const divertedFromClarification =
         state.workflowMode === WorkflowMode.AWAITING_CLARIFICATION;
 
+      // Combinational split: validate the classifier's sub-requests (shape +
+      // intent enum + non-empty text). Invalid → single-request fallback.
+      // Past MAX_COMBO_SUBS, extra texts fold into the last sub (answered
+      // jointly — never silently dropped) to bound per-turn fan-out.
+      const VALID_SUB_INTENTS = [
+        'NEW_TRANSACTION_BATCH',
+        'ANALYTICAL_QUERY',
+        'EDIT_OR_CONFIRM',
+        'UNKNOWN',
+      ];
+      let subRequests: Array<{ text: string; intent: string }> | null = null;
+      const rawSubs = Array.isArray(result.subRequests)
+        ? result.subRequests.filter(
+            (s: any) =>
+              s &&
+              typeof s.text === 'string' &&
+              s.text.trim() !== '' &&
+              VALID_SUB_INTENTS.includes(s.intent),
+          )
+        : [];
+      if (rawSubs.length > 1) {
+        const capped = rawSubs.slice(0, EXPENSE_CONFIG.MAX_COMBO_SUBS);
+        if (rawSubs.length > EXPENSE_CONFIG.MAX_COMBO_SUBS) {
+          logger.warn(
+            `Combinational turn has ${rawSubs.length} sub-requests (cap ${EXPENSE_CONFIG.MAX_COMBO_SUBS}) — folding extras into the last sub`,
+          );
+          const extras = rawSubs
+            .slice(EXPENSE_CONFIG.MAX_COMBO_SUBS)
+            .map((s: any) => s.text.trim())
+            .join('\n');
+          capped[capped.length - 1] = {
+            ...capped[capped.length - 1],
+            text: `${capped[capped.length - 1].text.trim()}\n${extras}`,
+          };
+        }
+        const combo: Array<{ text: string; intent: string }> = capped.map(
+          (s: any) => ({
+            text: s.text.trim(),
+            intent: s.intent,
+          }),
+        );
+        subRequests = combo;
+        logger.log(
+          `Combinational turn: ${combo.length} sub-requests [${combo.map((s) => s.intent).join(', ')}]`,
+        );
+      }
+
       return {
         intent,
         classificationConfidence: result.confidence,
+        subRequests,
+        // NOTE: pendingSubs is deliberately NOT reset here — a PENDING divert
+        // (mid-confirm question) passes through classify, and wiping it would
+        // destroy the deferred analytical subs of a mixed turn. Fresh turns
+        // always find it empty (answered after write, cleared on cancel/STOP).
         // A understood intent resets the gibberish counter; UNKNOWN keeps it
         // (request_user_clarification increments and bounds it).
         unknownAttempts: intent === 'UNKNOWN' ? state.unknownAttempts || 0 : 0,
@@ -108,7 +160,14 @@ export function createExpenseNodes(deps: {
         // persists in the checkpoint, so every entry node must clear it —
         // otherwise one chart is re-attached to every later balance, confirm
         // card and write receipt (62KB each, accumulating in DOM + checkpoint).
+        // Same for queryNote: a broaden/cap note from an earlier turn must
+        // never leak into a fresh answer (it once confessed broadening on a
+        // same-day result).
         chartImage: null,
+        queryNote: null,
+        // A fresh user turn consumes or voids any outstanding broaden offer:
+        // only routeFromStart's explicit affirmation path may act on it.
+        broadenOffered: false,
         ...(divertedFromClarification
           ? {
               workflowMode: WorkflowMode.IDLE,
@@ -120,6 +179,10 @@ export function createExpenseNodes(deps: {
               pendingClarificationContext: null,
               clarificationData: null,
               rawTransactions: [],
+              // Abandoned mid-clarification combinational subs would orphan
+              // (no transaction will ever complete to trigger them).
+              subRequests: null,
+              pendingSubs: [],
             }
           : {}),
         // Transcript: this node is the entry point for new requests
@@ -504,6 +567,9 @@ export function createExpenseNodes(deps: {
         error: null,
         status: null,
         chartImage: null,
+        // A clarification answer voids any broaden offer (it answers the
+        // waiting flow, not the old zero-hit ask).
+        broadenOffered: false,
         // Transcript: this node is the resume entry for AWAITING_CLARIFICATION.
         ...userEntry(state),
         ...countLlm(state, usage, calls),
@@ -696,6 +762,9 @@ export function createExpenseNodes(deps: {
         error: null,
         status: null,
         chartImage: null,
+        // A confirm/edit answer voids any broaden offer (it answers the
+        // pending batch, not the old zero-hit ask).
+        broadenOffered: false,
         // Transcript: this node is the resume entry for PENDING_CONFIRMATION.
         ...userEntry(state),
         ...countLlm(state, result.usage),
@@ -889,6 +958,8 @@ export function createExpenseNodes(deps: {
 
       // Full reset: cancel must leave no stale transaction/clarification
       // state in the checkpoint that a later validate could resurrect.
+      // Deferred analytical subs die with the turn (cancel aborts everything
+      // the message asked for — predictable, documented).
       return {
         pendingBatch: null,
         rawTransactions: [],
@@ -903,7 +974,110 @@ export function createExpenseNodes(deps: {
         confirmAction: null,
         edits: [],
         workflowMode: WorkflowMode.IDLE,
+        subRequests: null,
+        pendingSubs: [],
+        broadenOffered: false,
         ...assistantReply(state, 'Transaction cancelled.'),
+      };
+    },
+
+    start_combination: async (
+      state: ExpenseWorkflowStateType,
+    ): Promise<Partial<ExpenseWorkflowStateType>> => {
+      // Mixed turn entry: partition the split. Transaction texts (newline-
+      // joined, preserving per-line ↔ per-row alignment) become THE message
+      // for the normal multi-turn transaction path; analytical (+UNKNOWN)
+      // subs wait in pendingSubs for fresh post-write answers. No transcript
+      // write here — classify_intent already recorded the user's turn.
+      const subs = state.subRequests || [];
+      const txnTexts = subs
+        .filter(
+          (s) =>
+            s.intent === 'NEW_TRANSACTION_BATCH' ||
+            s.intent === 'EDIT_OR_CONFIRM',
+        )
+        .map((s) => s.text);
+      const pending = subs.filter(
+        (s) => s.intent === 'ANALYTICAL_QUERY' || s.intent === 'UNKNOWN',
+      );
+      logger.log(
+        `Starting combination: ${txnTexts.length} transaction part(s), ${pending.length} deferred analytical part(s)`,
+      );
+      return {
+        message: txnTexts.join('\n'),
+        intent: IntentType.NEW_TRANSACTION_BATCH,
+        pendingSubs: pending,
+      };
+    },
+
+    answer_subqueries: async (
+      state: ExpenseWorkflowStateType,
+    ): Promise<Partial<ExpenseWorkflowStateType>> => {
+      // All-analytical combination: answer every sub on its own scope in one
+      // turn (no waiting involved — nothing to defer). The turn's working
+      // scope becomes the zero-hit sub's filters when one zeroed (so a later
+      // "yes" broadens the scope that actually asked), else the last sub's.
+      const subs = state.subRequests || [];
+      const answered = await answerSubList(
+        {
+          queryInterpreter,
+          toolExecutor,
+          answerGenerator,
+          allowedToolCodes,
+          workflowPrompt,
+        },
+        subs,
+      );
+      const base = state.metadata || {};
+      logger.log(`Answered ${subs.length} sub-querie(s) in combination`);
+      return {
+        ...(answered.chartImage ? { chartImage: answered.chartImage } : {}),
+        ...assistantReply(state, answered.text),
+        workflowMode: WorkflowMode.IDLE,
+        filters: answered.zeroFilters ?? answered.lastFilters ?? state.filters,
+        metadata: {
+          ...base,
+          llmCalls: (base.llmCalls || 0) + answered.llmCalls,
+          tokens: (base.tokens || 0) + answered.usage.totalTokens,
+          toolCalls: (base.toolCalls || 0) + answered.toolCalls,
+        },
+      };
+    },
+
+    answer_deferred_subs: async (
+      state: ExpenseWorkflowStateType,
+    ): Promise<Partial<ExpenseWorkflowStateType>> => {
+      // Mixed-turn tail: the batch just wrote — answer the deferred
+      // analytical subs from FRESH post-write reads (a balance answered
+      // before the write would be stale). The combined receipt leads with
+      // the write confirmation already in lastResponse, then the subs.
+      const subs = state.pendingSubs || [];
+      const answered = await answerSubList(
+        {
+          queryInterpreter,
+          toolExecutor,
+          answerGenerator,
+          allowedToolCodes,
+          workflowPrompt,
+        },
+        subs,
+      );
+      const base = state.metadata || {};
+      logger.log(`Answered ${subs.length} deferred sub-querie(s) after write`);
+      const receipt = state.lastResponse || '';
+      const combined = receipt ? `${receipt}\n\n${answered.text}` : answered.text;
+      return {
+        ...(answered.chartImage ? { chartImage: answered.chartImage } : {}),
+        ...assistantReply(state, combined),
+        workflowMode: WorkflowMode.IDLE,
+        pendingSubs: [],
+        filters: answered.zeroFilters ?? answered.lastFilters ?? state.filters,
+        metadata: {
+          ...base,
+          llmCalls: (base.llmCalls || 0) + answered.llmCalls,
+          tokens: (base.tokens || 0) + answered.usage.totalTokens,
+          toolCalls: (base.toolCalls || 0) + answered.toolCalls,
+        },
       };
     },
 
@@ -945,6 +1119,21 @@ export function createExpenseNodes(deps: {
       const f = result.filters || {};
       const amountFloor = f.amountMin ?? 0;
       const amountCeil = f.amountMax ?? 0;
+      // Broaden-on-consent (detection only — the scoped return sits below,
+      // after aggregation/filters are computed): "broaden it / wider / for
+      // 2 weeks" reuses the PREVIOUS turn's scope (modes/categories/sheets)
+      // with newly stated (or dropped) dates. Widening happens ONLY on the
+      // user's word — never automatically (see validate/transform).
+      const broadenHit =
+        /\b(broaden|broader|widen|wider|expand|extend)\b/i.test(
+          state.message || '',
+        ) &&
+        !!state.filters &&
+        ((state.filters.modes?.length || 0) > 0 ||
+          (state.filters.categories?.length || 0) > 0);
+      if (broadenHit) {
+        logger.log('Broaden-on-consent — reusing previous scope with new dates');
+      }
       const hasOwnScope =
         (f.modes?.length || 0) > 0 ||
         (f.categories?.length || 0) > 0 ||
@@ -954,7 +1143,7 @@ export function createExpenseNodes(deps: {
         (result.limit ?? null) !== null ||
         !!result.wantsBalances || !!result.chartRequested;
 
-      if (!hasOwnScope && (state.retrievedTransactions?.length || 0) > 0) {
+      if (!hasOwnScope && (state.retrievedTransactions?.length || 0) > 0 && !broadenHit) {
         logger.log('Bare follow-up — reusing previous retrieval scope for details');
         return {
           queryIntent: 'DETAIL_LIST',
@@ -964,6 +1153,8 @@ export function createExpenseNodes(deps: {
           balanceRequested: false,
           chartRequested: false,
           chartType: null,
+          // A bare follow-up ("details?", "them?") IS a row-detail request.
+          detailsRequested: true,
           ...countLlm(state, result.usage),
         };
       }
@@ -1002,6 +1193,36 @@ export function createExpenseNodes(deps: {
         logger.log('Balance question detected deterministically — forcing sheet-balance read');
       }
 
+      // Broaden-on-consent return: previous scope (modes/categories/sheets)
+      // with the newly interpreted (or dropped) dates. Bare "broaden it"
+      // carries old filters and drops dates; "broaden it for 2 weeks"
+      // carries them into the new window.
+      if (broadenHit) {
+        const carried = state.filters || {};
+        return {
+          queryIntent: aggregationType,
+          filters: {
+            ...(result.filters || {}),
+            modes: carried.modes || [],
+            categories: carried.categories || [],
+            sheets:
+              (result.filters?.sheets?.length || 0) > 0
+                ? result.filters.sheets
+                : carried.sheets || [],
+          },
+          aggregation,
+          timeRange: {
+            dateFrom: result.filters?.dateFrom ?? null,
+            dateTo: result.filters?.dateTo ?? null,
+          },
+          balanceRequested: false,
+          chartRequested: !!result.chartRequested,
+          chartType: result.chartType || null,
+          detailsRequested: !!result.wantsDetails,
+          ...countLlm(state, result.usage),
+        };
+      }
+
       return {
         queryIntent: aggregationType,
         filters,
@@ -1013,6 +1234,8 @@ export function createExpenseNodes(deps: {
         balanceRequested,
         chartRequested: !!result.chartRequested,
         chartType: result.chartType || null,
+        // Row-detail shaping only — never changes filters/aggregation.
+        detailsRequested: !!result.wantsDetails,
         ...countLlm(state, result.usage),
       };
     },
@@ -1070,60 +1293,61 @@ export function createExpenseNodes(deps: {
         };
       }
 
-      // Zero hits behind a COLOR-category filter are suspect, not legitimate:
-      // users can't see what's painted which color, so the mapping itself may
-      // be wrong. Route to transform (which progressively drops the category)
-      // instead of answering "nothing found".
-      if (
-        count === 0 &&
-        hasCategoryFilter &&
-        (state.transformationAttempt || 0) <
-          EXPENSE_CONFIG.MAX_QUERY_TRANSFORMATIONS
-      ) {
-        return {
-          queryResultStatus: 'INSUFFICIENT',
-          insufficiencyReason: 'CATEGORY_TOO_NARROW',
-        };
-      }
-
-      // Genuinely answerable zero-result query (no color-category involved)
-      const genuinelyAnswerable =
-        count === 0 &&
-        !hasCategoryFilter &&
-        (classificationConfidence > 0.8 ||
-          (state.filters?.category && state.timeRange?.dateFrom));
-
-      if (genuinelyAnswerable) {
-        // User asked clear question, zero is honest answer
+      // Zero hits are answered honestly ("none in that scope — broaden or
+      // leave it?"); the answer prompt carries the ask. NEVER silently drop
+      // the user's dates/modes/categories to manufacture rows — different
+      // scope is a different question, and widening needs the user's word
+      // (see broaden-carry in interpretQuery). No confidence carve-outs, no
+      // category carve-outs: an empty book section is a legitimate answer.
+      // The broaden offer goes outstanding: a bare "yes" next turn consumes
+      // it (broaden_previous); anything else clears it at its entry node.
+      if (count === 0) {
         return {
           queryResultStatus: 'SUFFICIENT',
           queryResultType: 'ZERO_LEGITIMATE',
+          broadenOffered: true,
         };
       }
 
-      // Likely retrieval/interpretation problem
-      const likelyProblem =
-        (count === 0 && classificationConfidence < 0.5) ||
-        (count === 0 && !state.timeRange?.dateFrom) ||
-        count > 100;
-
+      // Too many rows to answer usefully: cap at the newest 100 (bounded
+      // retry preserved for structure, transform applies the cap + note).
       if (
-        likelyProblem &&
+        count > 100 &&
         (state.transformationAttempt || 0) <
           EXPENSE_CONFIG.MAX_QUERY_TRANSFORMATIONS
       ) {
         return {
           queryResultStatus: 'INSUFFICIENT',
-          insufficiencyReason:
-            count === 0 ? 'AMBIGUOUS_OR_TOO_NARROW' : 'TOO_BROAD',
+          insufficiencyReason: 'TOO_BROAD',
         };
       }
 
       // Sufficient (or max attempts reached)
       return {
         queryResultStatus: 'SUFFICIENT',
-        queryResultType:
-          count === 0 ? 'ZERO_AFTER_TRANSFORM' : 'SUCCESS',
+        queryResultType: 'SUCCESS',
+      };
+    },
+
+    broaden_previous: async (
+      state: ExpenseWorkflowStateType,
+    ): Promise<Partial<ExpenseWorkflowStateType>> => {
+      // Broaden consent CONSUMED: re-run the previous scope dateless (modes,
+      // categories, sheets, limit and aggregation intent all preserved).
+      // Terminates: afterwards there are no dates left to drop, so a further
+      // "yes" finds no widenable scope and falls through to classification.
+      const prior = state.filters || {};
+      logger.log('Broaden consent consumed — re-running previous scope dateless');
+      return {
+        filters: {
+          ...prior,
+          dateFrom: null,
+          dateTo: null,
+        },
+        timeRange: { dateFrom: null, dateTo: null },
+        queryNote: 'Broadened to all dates on your confirmation.',
+        broadenOffered: false,
+        ...userEntry(state),
       };
     },
 
@@ -1133,33 +1357,21 @@ export function createExpenseNodes(deps: {
       const attempt = state.transformationAttempt || 0;
       logger.log(`Transforming query (attempt ${attempt})`);
 
-      // Progressive broadening: drop ONE constraint family per attempt so a
-      // zero-hit query degrades gracefully instead of answering "nothing
-      // found". Order: dates → modes → color-categories. The date/mode drops
-      // are silent; dropping the COLOR category changes semantics, so it
-      // sets queryNote which the answer generator must disclose.
+      // The ONLY transform left is the too-broad cap: show the newest 100
+      // with a disclosed note. Constraint-dropping (dates/modes/categories)
+      // was removed deliberately — silently answering a wider question than
+      // asked is worse than answering "none found".
       const filters = { ...(state.filters || {}) };
       let queryNote: string | null = state.queryNote || null;
 
-      if (attempt === 0) {
-        filters.dateFrom = null;
-        filters.dateTo = null;
+      if (state.insufficiencyReason === 'TOO_BROAD') {
+        filters.limit = 100;
         queryNote =
-          queryNote ||
-          'No matches in the requested date range, so I broadened the dates.';
-      } else if (attempt === 1) {
-        filters.modes = [];
-        queryNote =
-          'No matches with the payment-mode filter, so I broadened to all modes.';
-      } else {
-        filters.categories = [];
-        queryNote =
-          'No transactions matched the color-category filter, so I broadened to all spending in range.';
+          queryNote || 'Too many matches — showing the newest 100.';
       }
 
       return {
         filters,
-        timeRange: { dateFrom: null, dateTo: null },
         transformationAttempt: attempt + 1,
         queryNote,
       };
@@ -1172,6 +1384,13 @@ export function createExpenseNodes(deps: {
 
       // Call real LLM — uses workflowPrompt from agent_workflows.prompt (DB)
       // This is GENERIC: the prompt field drives domain context, not hardcoded logic
+      const details =
+        !!state.detailsRequested || state.queryIntent === 'DETAIL_LIST';
+      // Column scoping is deterministic and meaning-based, not example-based:
+      // a query restricting the answer to descriptions ("description only",
+      // "just the reasons") lists one description per line and NOTHING else
+      // — no amounts, modes, dates, totals or breakdowns.
+      const detailScope = detailScopeFor(state.message, details);
       const result = await answerGenerator.generate({
         transactions: state.retrievedTransactions || [],
         queryIntent: state.queryIntent || 'unknown',
@@ -1183,6 +1402,9 @@ export function createExpenseNodes(deps: {
           state.filters?.modes && state.filters.modes.length > 0
             ? state.filters.modes
             : null,
+        details,
+        maxRows: details ? EXPENSE_CONFIG.MAX_ROW_ENUMERATION : 20,
+        detailScope,
       });
 
       return {
@@ -1196,6 +1418,67 @@ export function createExpenseNodes(deps: {
       state: ExpenseWorkflowStateType,
     ): Promise<Partial<ExpenseWorkflowStateType>> => {
       logger.log('Validating generated answer');
+
+      // Shared details gate (used by the balance branch for combined
+      // questions and by the numbers gate below): null when details don't
+      // apply or rows are all present, otherwise the specific miss to feed
+      // back. Defined first — both branches below call it.
+      const detailsMode =
+        !!state.detailsRequested || state.queryIntent === 'DETAIL_LIST';
+      const rowCount = state.retrievalCount || 0;
+      const detailsMiss = (): string | null => {
+        if (
+          !detailsMode ||
+          rowCount === 0 ||
+          rowCount > EXPENSE_CONFIG.MAX_ROW_ENUMERATION
+        ) {
+          return null;
+        }
+        // Substance check, paraphrase-tolerant: the old verbatim-includes
+        // test forced robotic echoes ("…in WITHDRAW MONEY… (mode: PHONEPAY)").
+        // Now each row passes when (a) at least half its significant words
+        // (4+ chars) appear, and (b) its amount digits appear. Paraphrase
+        // welcome, facts mandatory.
+        const flatText = (state.generatedAnswer || '').toLowerCase();
+        const flatNums = ` ${(state.generatedAnswer || '').replace(/[^0-9]/g, ' ')} `;
+        const missing = (state.retrievedTransactions || [])
+          .filter((t) => String(t?.description || '').trim() !== '')
+          .filter((t) => {
+            const words = [
+              ...new Set(
+                String(t.description)
+                  .toUpperCase()
+                  .split(/[^A-Z0-9]+/)
+                  .filter((w) => w.length >= 4),
+              ),
+            ];
+            const hit = words.filter((w) =>
+              flatText.includes(w.toLowerCase()),
+            );
+            if (hit.length < Math.ceil(words.length / 2)) return true;
+            const amtNum =
+              Number(t.debit) || Number(t.credit) || Number(t.amount) || 0;
+            if (
+              amtNum > 0 &&
+              !flatNums.includes(` ${Math.round(amtNum)} `)
+            ) {
+              return true;
+            }
+            return false;
+          })
+          .map((t) => String(t.description));
+        if (
+          missing.length === 0 &&
+          (state.generatedAnswer || '').length > 20
+        ) {
+          return null;
+        }
+        return (
+          `List every retrieved transaction (date, description, amount, mode) ` +
+          `— ${missing.length} missing (e.g. ${missing.slice(0, 3).join(', ')}). ` +
+          `Then close with the one-line totals summary.`
+        );
+      };
 
       // Deterministic balance check: for balance questions the reply MUST
       // contain every expected sheet-balance figure. The LLM was given a
@@ -1236,12 +1519,71 @@ export function createExpenseNodes(deps: {
             answerFeedback: `Missing sheet balance(s) for ${missing.join(', ')} — start with the mandatory balance sentence`,
           };
         }
+        // Figures present — but for COMBINED questions (details also asked)
+        // a balances-only reply drops half the query. Demand the rows too;
+        // anything missing regenerates with the specific miss named.
+        const combinedMiss = detailsMiss();
+        if (combinedMiss !== null) {
+          logger.warn(`Combined answer omits rows — regenerating: ${combinedMiss}`);
+          if (
+            (state.regenerationAttempt || 0) >=
+            EXPENSE_CONFIG.MAX_ANSWER_REGENERATIONS
+          ) {
+            // Bounded: serve the figures-correct best effort as-is.
+            const keepWaitingBalance =
+              state.workflowMode === WorkflowMode.PENDING_CONFIRMATION ||
+              state.workflowMode === WorkflowMode.AWAITING_CLARIFICATION;
+            return {
+              answerStatus: 'SATISFACTORY',
+              ...assistantReply(state, state.generatedAnswer || 'No answer generated.'),
+              workflowMode: keepWaitingBalance ? state.workflowMode : WorkflowMode.IDLE,
+              unknownAttempts: 0,
+            };
+          }
+          return {
+            answerStatus: 'UNSATISFACTORY',
+            answerFeedback: combinedMiss,
+          };
+        }
+        // Figures present (and rows present when asked): a balances-only
+        // answer is COMPLETE — it must not fall through to the numbers gate
+        // below (which would force transaction totals into a balance answer).
+        const keepWaitingBalance =
+          state.workflowMode === WorkflowMode.PENDING_CONFIRMATION ||
+          state.workflowMode === WorkflowMode.AWAITING_CLARIFICATION;
+        return {
+          answerStatus: 'SATISFACTORY',
+          ...assistantReply(state, state.generatedAnswer || 'No answer generated.'),
+          workflowMode: keepWaitingBalance ? state.workflowMode : WorkflowMode.IDLE,
+          unknownAttempts: 0,
+        };
       }
 
-      const satisfactory =
+      const satisfactoryBase =
         state.generatedAnswer &&
         state.generatedAnswer.length > 20 &&
         (state.includesAggregation || state.retrievalCount === 0);
+
+      // Row-detail answers are satisfactory when every retrieved row is
+      // enumerated (descriptions present) — totals are a bonus, not a
+      // requirement. Without this branch the numbers-only gate below vetoes
+      // exactly the descriptive answers the user asked for. Capped: above
+      // MAX_ROW_ENUMERATION the totals gate applies (listing hundreds of
+      // rows costs more than it is worth).
+      let satisfactory = satisfactoryBase;
+      let feedback = 'Too vague, needs numerical precision';
+      const miss = detailsMiss();
+      if (
+        miss === null &&
+        detailsMode &&
+        rowCount > 0 &&
+        rowCount <= EXPENSE_CONFIG.MAX_ROW_ENUMERATION
+      ) {
+        satisfactory = true;
+      } else if (miss !== null) {
+        satisfactory = false;
+        feedback = miss;
+      }
 
       if (
         satisfactory ||
@@ -1265,7 +1607,7 @@ export function createExpenseNodes(deps: {
 
       return {
         answerStatus: 'UNSATISFACTORY',
-        answerFeedback: 'Too vague, needs numerical precision',
+        answerFeedback: feedback,
       };
     },
 
@@ -1278,6 +1620,8 @@ export function createExpenseNodes(deps: {
 
       // Call real LLM with feedback about why the previous answer was unsatisfactory
       // workflowPrompt ensures generic domain context from DB, not hardcoded
+      const details =
+        !!state.detailsRequested || state.queryIntent === 'DETAIL_LIST';
       const result = await answerGenerator.regenerate({
         transactions: state.retrievedTransactions || [],
         queryIntent: state.queryIntent || 'unknown',
@@ -1290,6 +1634,9 @@ export function createExpenseNodes(deps: {
           state.filters?.modes && state.filters.modes.length > 0
             ? state.filters.modes
             : null,
+        details,
+        maxRows: details ? EXPENSE_CONFIG.MAX_ROW_ENUMERATION : 20,
+        detailScope: detailScopeFor(state.message, details),
       });
 
       return {
@@ -1329,43 +1676,15 @@ export function createExpenseNodes(deps: {
         };
       }
 
-      // Deterministic grouping: debit per color-category (uncategorized rows
-      // grouped honestly instead of dropped).
-      const sums: Record<string, number> = {};
-      for (const t of txns) {
-        const cat =
-          t.colourCategory || t.category || 'UNCATEGORIZED';
-        sums[cat] =
-          (sums[cat] || 0) + (Number(t.debit) || Number(t.amount) || 0);
-      }
-      const labels = Object.keys(sums);
-      const data = labels.map((l) => Math.round(sums[l] * 100) / 100);
-      const total = data.reduce((a, b) => a + b, 0);
-      const requested = state.chartType || 'pie';
-      const chartType =
-        requested === 'bar' || requested === 'line' || requested === 'pie'
-          ? requested
-          : 'pie';
-
-      const result = await toolExecutor.execute(
-        'generate_chart',
-        {
-          chartType,
-          data: { labels, datasets: [{ label: 'Spending', data }] },
-          title: 'Spending by category',
-        },
-        allowedToolCodes,
+      const chart = await renderChartContent(
+        { toolExecutor, allowedToolCodes },
+        txns,
+        state.chartType,
       );
 
-      const chartImage = Buffer.from(result.imageBuffer).toString('base64');
-      logger.log(`Chart rendered: ${result.imageBuffer.length} bytes`);
-
       return {
-        chartImage,
-        ...assistantReply(
-          state,
-          `Chart of your spending across ${labels.length} categor${labels.length === 1 ? 'y' : 'ies'} (total debit ₹${total.toLocaleString('en-IN')}).`,
-        ),
+        chartImage: chart.chartImage,
+        ...assistantReply(state, chart.text),
         workflowMode: WorkflowMode.IDLE,
         ...countTool(state),
       };
@@ -1812,6 +2131,282 @@ function isGenericDescription(desc: unknown): boolean {
  */
 function escapeRegExp(text: string): string {
   return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+/**
+ * Deterministic detail-column scoping. A query restricting the answer to
+ * descriptions ("description only", "just the reasons") is answered with one
+ * description per line and NOTHING else. Meaning-based (restrictor +
+ * column words), never example-based.
+ */
+function detailScopeFor(message: unknown, details: boolean): string | null {
+  if (!details) return null;
+  const text = String(message || '');
+  if (/\bdescriptions?\b/i.test(text) && /\b(only|just)\b/i.test(text)) {
+    return 'descriptions-only';
+  }
+  return null;
+}
+
+/**
+ * Combinational sub-query plumbing (module-level, deps-param pattern like
+ * extractWithSegmentFallback — the single-query graph path stays untouched).
+ * One user message can carry several independent sub-requests ("log siva 100
+ * and what's my bank balance"); each analytical sub is interpreted, read and
+ * answered on its own scope, then joined. Transaction subs run the normal
+ * multi-turn flow first; analytical subs wait in pendingSubs and are answered
+ * from fresh post-write reads.
+ */
+interface SubPipelineDeps {
+  queryInterpreter: { interpret: (text: string) => Promise<any> };
+  toolExecutor: {
+    execute: (tool: string, input: any, allowed?: any) => Promise<any>;
+  };
+  answerGenerator: { generate: (input: any) => Promise<any> };
+  allowedToolCodes: string[];
+  workflowPrompt: string;
+}
+
+interface PlannedSub {
+  queryIntent: string;
+  filters: any;
+  aggregation: { type: 'SUM' | 'COUNT' | 'AVERAGE'; field: string } | null;
+  timeRange: { dateFrom: any; dateTo: any };
+  balanceRequested: boolean;
+  chartRequested: boolean;
+  chartType: string | null;
+  detailsRequested: boolean;
+  usage: LlmUsage;
+}
+
+/**
+ * Deterministic core mirrored from interpretQuery (which additionally handles
+ * bare-follow-up reuse and broaden-carry — both meaningless for a fresh
+ * sub-text, so deliberately not applied here).
+ */
+async function planAnalyticalSub(
+  deps: SubPipelineDeps,
+  subText: string,
+): Promise<PlannedSub> {
+  const result = await deps.queryInterpreter.interpret(subText);
+  const aggregationType = result.aggregationType || 'FILTER';
+  const aggregation =
+    aggregationType === 'SUM' ||
+    aggregationType === 'COUNT' ||
+    aggregationType === 'AVERAGE'
+      ? {
+          type: aggregationType,
+          field: result.aggregationField || 'amount',
+        }
+      : null;
+  const filters = {
+    ...(result.filters || {}),
+    limit: result.limit ?? result.filters?.limit ?? null,
+  };
+  const balanceRequested =
+    !!result.wantsBalances || BALANCE_QUESTION_RE.test(subText);
+  return {
+    queryIntent: aggregationType,
+    filters,
+    aggregation,
+    timeRange: {
+      dateFrom: result.filters?.dateFrom,
+      dateTo: result.filters?.dateTo,
+    },
+    balanceRequested,
+    chartRequested: !!result.chartRequested,
+    chartType: result.chartType || null,
+    detailsRequested: !!result.wantsDetails,
+    usage: result.usage,
+  };
+}
+
+/**
+ * Chart rendering factored for reuse (buildChart node + combinational subs).
+ * Identical grouping/math — callers wrap the reply/mode/metering.
+ */
+async function renderChartContent(
+  deps: Pick<SubPipelineDeps, 'toolExecutor' | 'allowedToolCodes'>,
+  txns: any[],
+  requestedType: string | null,
+): Promise<{ chartImage: string; text: string }> {
+  // Deterministic grouping: debit per color-category (uncategorized rows
+  // grouped honestly instead of dropped).
+  const sums: Record<string, number> = {};
+  for (const t of txns) {
+    const cat = t.colourCategory || t.category || 'UNCATEGORIZED';
+    sums[cat] = (sums[cat] || 0) + (Number(t.debit) || Number(t.amount) || 0);
+  }
+  const labels = Object.keys(sums);
+  const data = labels.map((l) => Math.round(sums[l] * 100) / 100);
+  const total = data.reduce((a, b) => a + b, 0);
+  const chartType =
+    requestedType === 'bar' || requestedType === 'line' || requestedType === 'pie'
+      ? requestedType
+      : 'pie';
+
+  const result = await deps.toolExecutor.execute(
+    'generate_chart',
+    {
+      chartType,
+      data: { labels, datasets: [{ label: 'Spending', data }] },
+      title: 'Spending by category',
+    },
+    deps.allowedToolCodes,
+  );
+
+  const chartImage = Buffer.from(result.imageBuffer).toString('base64');
+  logger.log(`Chart rendered: ${result.imageBuffer.length} bytes`);
+
+  return {
+    chartImage,
+    text: `Chart of your spending across ${labels.length} categor${labels.length === 1 ? 'y' : 'ies'} (total debit ₹${total.toLocaleString('en-IN')}).`,
+  };
+}
+
+/**
+ * Answer one analytical sub-request end to end (interpret → retrieve →
+ * answer, plus chart when requested). Metering is returned, not folded —
+ * callers own their metadata merge.
+ */
+async function answerAnalyticalSub(
+  deps: SubPipelineDeps,
+  subText: string,
+): Promise<{
+  text: string;
+  chartImage: string | null;
+  usage: LlmUsage;
+  llmCalls: number;
+  toolCalls: number;
+  count: number;
+  filters: any;
+}> {
+  const plan = await planAnalyticalSub(deps, subText);
+  let llmCalls = 1;
+  let toolCalls = 0;
+  const usage: LlmUsage = {
+    promptTokens: plan.usage?.promptTokens || 0,
+    completionTokens: plan.usage?.completionTokens || 0,
+    totalTokens: plan.usage?.totalTokens || 0,
+  };
+
+  // Retrieve (mirrors retrieveTransactions core: timeRange fallback dates,
+  // forwarded aggregation, authoritative balances on demand).
+  const filters = {
+    ...(plan.filters || {}),
+    dateFrom:
+      plan.filters?.dateFrom ?? plan.timeRange?.dateFrom ?? undefined,
+    dateTo: plan.filters?.dateTo ?? plan.timeRange?.dateTo ?? undefined,
+  };
+  const qres = await deps.toolExecutor.execute(
+    'query_transactions',
+    {
+      filters,
+      ...(plan.aggregation ? { aggregation: plan.aggregation } : {}),
+      ...(plan.balanceRequested ? { includeBalances: true } : {}),
+    },
+    deps.allowedToolCodes,
+  );
+  toolCalls++;
+  const txns = qres.transactions || [];
+  const count =
+    qres.aggregation?.count ?? qres.count ?? txns.length ?? 0;
+
+  // Chart first (when requested) — same content as the chart node.
+  let chartImage: string | null = null;
+  let chartText = '';
+  if (plan.chartRequested) {
+    if (txns.length === 0) {
+      chartText = 'There is no data to chart for that query.';
+    } else {
+      const ch = await renderChartContent(deps, txns, plan.chartType);
+      toolCalls++;
+      chartImage = ch.chartImage;
+      chartText = ch.text;
+    }
+  }
+
+  const details = plan.detailsRequested;
+  const gen = await deps.answerGenerator.generate({
+    transactions: txns,
+    queryIntent: plan.queryIntent,
+    workflowPrompt: deps.workflowPrompt,
+    count,
+    note: undefined,
+    balances: qres.balances || undefined,
+    balanceModes:
+      plan.filters?.modes && plan.filters.modes.length > 0
+        ? plan.filters.modes
+        : null,
+    details,
+    maxRows: details ? EXPENSE_CONFIG.MAX_ROW_ENUMERATION : 20,
+    detailScope: detailScopeFor(subText, details),
+  });
+  llmCalls++;
+  usage.promptTokens += gen.usage?.promptTokens || 0;
+  usage.completionTokens += gen.usage?.completionTokens || 0;
+  usage.totalTokens += gen.usage?.totalTokens || 0;
+
+  // No per-sub regen loop (bounded cost): trust the first draft; the shared
+  // validator gates single-query turns. Unclear subs surface as honest
+  // zero-hit answers ("none found — broaden?") via the normal prompt rules.
+  const text = chartText ? `${chartText}\n\n${gen.text}` : gen.text;
+  return { text, chartImage, usage, llmCalls, toolCalls, count, filters: plan.filters };
+}
+
+/**
+ * Answer a list of sub-requests ({text, intent}) and join them into one
+ * combined reply. UNKNOWN parts get a deterministic ask-back note (never
+ * answered as a query, never dropped silently). Every part opens by quoting
+ * its own sub-question — deterministic, user-worded labels, so a stranger
+ * can tell which answer belongs to which ask. Returns the joined text,
+ * the last chart image (if any sub charted), and summed metering.
+ */
+async function answerSubList(
+  deps: SubPipelineDeps,
+  subs: Array<{ text: string; intent: string }>,
+): Promise<{
+  text: string;
+  chartImage: string | null;
+  usage: LlmUsage;
+  llmCalls: number;
+  toolCalls: number;
+  /** Filters of the first zero-hit sub (a later "yes" broadens THIS scope). */
+  zeroFilters: any | null;
+  /** Filters of the last sub (the turn's working scope when none zeroed). */
+  lastFilters: any | null;
+}> {
+  const parts: string[] = [];
+  let chartImage: string | null = null;
+  const usage: LlmUsage = { promptTokens: 0, completionTokens: 0, totalTokens: 0 };
+  let llmCalls = 0;
+  let toolCalls = 0;
+  let zeroFilters: any | null = null;
+  let lastFilters: any | null = null;
+  for (const sub of subs) {
+    // Plain-text label (the client renders raw text, no markdown) quoting
+    // the asker's own words — generic, never hardcoded.
+    const label = `On "${sub.text}":`;
+    if (sub.intent === 'UNKNOWN') {
+      parts.push(
+        `${label}\n\nI couldn't understand this part — please rephrase just that bit.`,
+      );
+      continue;
+    }
+    const answered = await answerAnalyticalSub(deps, sub.text);
+    parts.push(`${label}\n\n${answered.text}`);
+    lastFilters = answered.filters;
+    if (zeroFilters === null && answered.count === 0) {
+      zeroFilters = answered.filters;
+    }
+    if (answered.chartImage) chartImage = answered.chartImage;
+    llmCalls += answered.llmCalls;
+    toolCalls += answered.toolCalls;
+    usage.promptTokens += answered.usage.promptTokens;
+    usage.completionTokens += answered.usage.completionTokens;
+    usage.totalTokens += answered.usage.totalTokens;
+  }
+  return { text: parts.join('\n\n'), chartImage, usage, llmCalls, toolCalls, zeroFilters, lastFilters };
 }
 
 /**

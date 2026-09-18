@@ -70,6 +70,20 @@ export const ExpenseEdges = {
       return 'classify_intent';
     }
 
+    // Broaden consent: a bare affirmation ("yes") right after a zero-hit
+    // query re-runs the previous scope dateless. Requires an outstanding
+    // offer AND widenable dates — otherwise it terminates here (a later
+    // "yes" finds no dates to drop and falls through to classification).
+    // Waiting states above take precedence, so "yes" mid-confirm still
+    // confirms and "yes" mid-clarification still answers.
+    if (
+      isAffirmation(state.message) &&
+      state.broadenOffered === true &&
+      (state.filters?.dateFrom || state.filters?.dateTo)
+    ) {
+      return 'broaden_previous';
+    }
+
     // NEW REQUEST: Normal classification
     return 'classify_intent';
   },
@@ -80,13 +94,30 @@ export const ExpenseEdges = {
 
   /**
    * Route based on classified intent
-   * 
+   *
+   * - COMBINATIONAL (2+ sub-requests) → start_combination (mixed, transaction
+   *   first) or answer_subqueries (all analytical). Only when the primary
+   *   intent passed the confidence gate — a forced UNKNOWN stays single.
    * - NEW_TRANSACTION → parse_transactions
    * - ANALYTICAL_QUERY → interpret_query
    * - EDIT_OR_CONFIRM → parse_edit_or_confirm
    * - UNKNOWN → request_user_clarification
    */
   routeByIntent: (state: ExpenseWorkflowStateType): string => {
+    const subs = state.subRequests;
+    if (
+      state.intent !== 'UNKNOWN' &&
+      subs &&
+      subs.length > 1
+    ) {
+      const hasTxn = subs.some(
+        (s) =>
+          s.intent === 'NEW_TRANSACTION_BATCH' ||
+          s.intent === 'EDIT_OR_CONFIRM',
+      );
+      return hasTxn ? 'start_combination' : 'answer_subqueries';
+    }
+
     if (state.intent === 'NEW_TRANSACTION_BATCH') {
       // Never silently overwrite an unconfirmed batch: if the user starts a
       // new transaction while one awaits confirmation, re-present the pending
@@ -177,6 +208,24 @@ export const ExpenseEdges = {
     return 'handle_error';
   },
 
+  /**
+   * Route after the financial write.
+   *
+   * - success + deferred analytical subs → answer_deferred_subs (fresh
+   *   post-write reads — a balance answered before the write would be stale)
+   * - anything else → END (failures keep batch + subs for later resume)
+   */
+  routeAfterWrite: (state: ExpenseWorkflowStateType): string | typeof END => {
+    if (
+      state.status === 'success' &&
+      state.pendingSubs &&
+      state.pendingSubs.length > 0
+    ) {
+      return 'answer_deferred_subs';
+    }
+    return END;
+  },
+
   // ========================================
   // QUERY PATH ROUTING
   // ========================================
@@ -243,6 +292,17 @@ export const ExpenseEdges = {
 function isCancelMessage(message: string): boolean {
   return /^(cancel|cancelled|never\s?mind|forget\s(it|this)|leave\sit|no\s?(thanks|thank\syou)?)$/i.test(
     (message || '').trim(),
+  );
+}
+
+/**
+ * Bare-affirmation matcher for broaden consent. Anchored full match only —
+ * "yes, broaden it for 2 weeks" carries its own scope via the keyword path;
+ * this is for the lone "yes" answering a zero-hit broaden offer.
+ */
+function isAffirmation(message: string): boolean {
+  return /^(yes|yeah|yup|yep|ok|okay|sure|do it|please do|go ahead|sounds good)$/i.test(
+    (message || '').trim().replace(/[!.?]+$/, ''),
   );
 }
 

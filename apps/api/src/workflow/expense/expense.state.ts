@@ -102,6 +102,7 @@ export enum IntentType {
   NEW_TRANSACTION_BATCH = 'NEW_TRANSACTION_BATCH',
   ANALYTICAL_QUERY = 'ANALYTICAL_QUERY',
   EDIT_OR_CONFIRM = 'EDIT_OR_CONFIRM',
+  UNKNOWN = 'UNKNOWN',
 }
 
 /**
@@ -417,6 +418,39 @@ export const ExpenseWorkflowState = Annotation.Root({
     default: () => false,
   }),
 
+  /** Whether the answer must enumerate individual rows (descriptions), not
+   * just totals. Set by the interpreter when the query asks to see/list/
+   * describe transactions; implied by the DETAIL_LIST follow-up path. */
+  detailsRequested: Annotation<boolean>({
+    reducer: (_, value) => value,
+    default: () => false,
+  }),
+
+  /** Segmented sub-requests for combinational turns
+   * ([{text, intent}]), set by classify_intent. Single-request turns hold
+   * exactly one element. Consumed by routing; persisted for debugging. */
+  subRequests: Annotation<Array<{ text: string; intent: string }> | null>({
+    reducer: (_, value) => value,
+    default: () => null,
+  }),
+
+  /** Analytical sub-request texts deferred past transaction completion.
+   * Set by start_combination on mixed turns; answered (fresh reads) after
+   * the batch writes; cleared on cancel/STOP. Empty when nothing pends. */
+  pendingSubs: Annotation<Array<{ text: string; intent: string }>>({
+    reducer: (_, value) => value,
+    default: () => [],
+  }),
+
+  /** Zero-hit broaden offer outstanding: the previous turn answered "none in
+   * that scope — broaden?" and awaits the user's word. A bare affirmation
+   * ("yes") consumes it (previous scope re-run dateless); any real query,
+   * transaction, cancel or STOP clears it. Never persists across scopes. */
+  broadenOffered: Annotation<boolean>({
+    reducer: (_, value) => value,
+    default: () => false,
+  }),
+
   /** Requested chart type. */
   chartType: Annotation<string | null>({
     reducer: (_, value) => value,
@@ -562,6 +596,10 @@ export function createInitialState(
     balanceRequested: false,
     chartRequested: false,
     chartType: null,
+    detailsRequested: false,
+    subRequests: null,
+    pendingSubs: [],
+    broadenOffered: false,
     queryResultStatus: null,
     queryResultType: null,
     insufficiencyReason: null,

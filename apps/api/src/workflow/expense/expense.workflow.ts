@@ -83,10 +83,13 @@ export class ExpenseWorkflow {
       allowedToolCodes,
     });
 
-    // Build graph using fluent chaining
+    // Build graph using fluent chaining (26 nodes)
     const compiledGraph = new StateGraph(ExpenseWorkflowState)
-      // Add all 22 nodes
       .addNode('classify_intent', nodes.classifyIntent)
+      .addNode('start_combination', nodes.start_combination)
+      .addNode('answer_subqueries', nodes.answer_subqueries)
+      .addNode('answer_deferred_subs', nodes.answer_deferred_subs)
+      .addNode('broaden_previous', nodes.broaden_previous)
       .addNode('parse_transactions', nodes.parseTransactions)
       .addNode('validate_transaction_data', nodes.validateTransactionData)
       .addNode('request_clarification', nodes.requestClarification)
@@ -112,6 +115,8 @@ export class ExpenseWorkflow {
       // Add edges
       .addConditionalEdges(START, ExpenseEdges.routeFromStart)
       .addConditionalEdges('classify_intent', ExpenseEdges.routeByIntent)
+      .addEdge('start_combination', 'parse_transactions')
+      .addEdge('broaden_previous', 'retrieve_transactions')
       .addEdge('parse_transactions', 'validate_transaction_data')
       .addConditionalEdges('validate_transaction_data', ExpenseEdges.routeAfterValidation)
       .addEdge('request_clarification', END) // Waiting state
@@ -120,7 +125,8 @@ export class ExpenseWorkflow {
       .addEdge('present_batch', END) // Waiting state
       .addConditionalEdges('parse_edit_or_confirm', ExpenseEdges.routeAfterEditConfirm)
       .addEdge('merge_edits', 'present_batch')
-      .addEdge('write_batch', END)
+      .addConditionalEdges('write_batch', ExpenseEdges.routeAfterWrite)
+      .addEdge('answer_deferred_subs', END)
       .addEdge('clear_batch', END)
       .addEdge('reject_incomplete_transaction', END)
       .addEdge('interpret_query', 'retrieve_transactions')
@@ -310,6 +316,9 @@ export class ExpenseWorkflow {
         validationStatus: null,
         confirmAction: null,
         edits: [],
+        subRequests: null,
+        pendingSubs: [],
+        broadenOffered: false,
         error: null,
         status: null,
         lastResponse: 'Flow stopped.',
