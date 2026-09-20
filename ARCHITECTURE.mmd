@@ -1,0 +1,201 @@
+%% Agent Fox: system architecture
+%% Frontends -> NestJS API -> LangGraph (nodes + loopbacks) -> Azure AI / Tools -> Storage
+flowchart TB
+
+    classDef client   fill:#e7f0ff,stroke:#3b6fd4,color:#0b1f44
+    classDef api      fill:#eaf7ee,stroke:#2f8f4e,color:#0b2e17
+    classDef gnode    fill:#fff8e1,stroke:#c29200,color:#3a2b00
+    classDef router   fill:#ffe9c7,stroke:#d97706,color:#3a2200
+    classDef terminal fill:#fde8e8,stroke:#c0392b,color:#4a0f0a
+    classDef llm      fill:#f3e8ff,stroke:#8b3fd9,color:#2a0b4a
+    classDef tool     fill:#e0f7fa,stroke:#00838f,color:#00252a
+    classDef store    fill:#eceff1,stroke:#546e7a,color:#1c2a30
+
+    %% ───────────────────────── FRONTENDS ─────────────────────────
+    subgraph CLIENTS["FRONTENDS (two channels, one brain)"]
+        WEB["React + Vite :5173<br/>useChat / useThreadId<br/>threadId in localStorage<br/>requestId = UUID per message<br/>ChatErrorBoundary"]
+        DC["Discord bot (DM-only)<br/>gateway WebSocket, outbound<br/>fail-closed allowlist<br/>threadId = dc_userId<br/>requestId = message id"]
+    end
+
+    %% ───────────────────────── NESTJS API ─────────────────────────
+    subgraph API["NESTJS API :3009"]
+        CHAT["ChatController<br/>POST /api/chat<br/>idempotency cache"]
+        RECOVER["GET /api/chat/state/:threadId<br/>session recovery"]
+        DCS["DiscordService<br/>embeds + Confirm/Cancel buttons<br/>2000-char chunking, chart PNG"]
+        WFS["WorkflowService.execute<br/>1 acquire thread lock<br/>2 cancel / STOP check<br/>3 registry lookup<br/>4 tracking + metering<br/>5 graph.invoke"]
+    end
+
+    %% ───────────────────────── LANGGRAPH ─────────────────────────
+    subgraph GRAPH["LANGGRAPH EXPENSE WORKFLOW (one invoke per turn, no interrupt/resume)"]
+        S0(["START"])
+        RFS{"routeFromStart<br/>reads workflowMode"}
+        BP["broaden_previous"]
+        CI["classify_intent<br/>confidence gate 0.7<br/>combo splitter, clears stale output"]
+        RBI{"routeByIntent"}
+        RUC["request_user_clarification"]
+
+        %% transaction path
+        PT["parse_transactions<br/>segment fallback"]
+        VT{"validate_transaction_data<br/>per-item, per-slot"}
+        PB["present_batch<br/>review card"]
+        RC["request_clarification<br/>one slot at a time"]
+        RIT["reject_incomplete_transaction<br/>budget exhausted"]
+        PCL["parse_clarification"]
+        MWP["merge_with_pending"]
+        PEC{"parse_edit_or_confirm"}
+        ME["merge_edits"]
+        WB["write_batch<br/>committed-write keys"]
+        CB["clear_batch"]
+
+        %% query path
+        IQ["interpret_query"]
+        RT["retrieve_transactions"]
+        VQ{"validate_query_result"}
+        TQ["transform_query<br/>newest-100 cap"]
+        GA["generate_answer"]
+        VA{"validate_answer<br/>figure + substance check"}
+        RA["regenerate_answer"]
+        ZH["zero-hit reply<br/>broaden or leave it?"]
+        BC["build_chart"]
+
+        %% combo path
+        SC["start_combination<br/>max 4 subRequests"]
+        ASQ["answer_subqueries"]
+        ADS["answer_deferred_subs<br/>fresh reads after write"]
+
+        FIN(["END<br/>reply returned, state checkpointed"])
+
+        %% entry routing
+        S0 --> RFS
+        RFS -->|"AWAITING_CLARIFICATION"| PCL
+        RFS -->|"PENDING_CONFIRMATION"| PEC
+        RFS -->|"AWAITING_USER_CLARIF"| CI
+        RFS -->|"bare yes + broaden offer"| BP
+        RFS -->|"fresh message"| CI
+        BP --> RT
+        CI --> RBI
+        RBI -->|"NEW_TRANSACTION_BATCH"| PT
+        RBI -->|"EDIT_OR_CONFIRM"| PEC
+        RBI -->|"ANALYTICAL_QUERY"| IQ
+        RBI -->|"mixed txn + query"| SC
+        RBI -->|"all analytical subs"| ASQ
+        RBI -->|"UNKNOWN or low confidence"| RUC
+        RUC --> FIN
+
+        %% transaction flow
+        PT --> VT
+        VT -->|"COMPLETE"| PB
+        VT -->|"MISSING_INFO"| RC
+        VT -->|"budget exhausted"| RIT
+        PB --> FIN
+        RC --> FIN
+        RIT --> FIN
+        PCL --> MWP
+        MWP -->|"LOOPBACK 1: revalidate, max 3 attempts / 6 rounds"| VT
+        PEC -->|"CONFIRM"| WB
+        PEC -->|"EDIT"| ME
+        PEC -->|"CANCEL"| CB
+        ME -->|"LOOPBACK 2: re-present"| PB
+        CB --> FIN
+        WB -->|"success, receipt"| FIN
+        WB -->|"overdraft or ETag conflict: batch kept"| FIN
+        WB -->|"deferred subs pending"| ADS
+
+        %% query flow
+        IQ --> RT
+        RT --> VQ
+        VQ -->|"SUFFICIENT"| GA
+        VQ -->|"TOO_BROAD"| TQ
+        VQ -->|"ZERO"| ZH
+        VQ -->|"chart requested"| BC
+        TQ -->|"LOOPBACK 3: re-retrieve, cap 3"| RT
+        GA --> VA
+        VA -->|"passes"| FIN
+        VA -->|"fails"| RA
+        RA -->|"LOOPBACK 4: revalidate, cap 2"| VA
+        ZH --> FIN
+        BC --> FIN
+
+        %% combo flow
+        SC -->|"txn text re-run"| PT
+        SC -.->|"analytical subs saved as pendingSubs"| ADS
+        ASQ --> FIN
+        ADS --> FIN
+    end
+
+    %% ───────────────────────── AZURE AI / LLM ─────────────────────────
+    subgraph LLM["LLM LAYER (apps/api/src/llm, prompts are generic and meaning-based)"]
+        L1["Intent classifier<br/>+ combinational splitter"]
+        L2["Transaction extractor<br/>+ schema validator (sanitize, not nuke)"]
+        L3["Edit / clarification parser"]
+        L4["Query interpreter<br/>wantsDetails, wantsBalances"]
+        L5["Answer generator<br/>+ regenerator"]
+        AZ["Azure AI gpt-5-mini<br/>structured JSON-schema calls<br/>fixed temperature"]
+        L1 --> AZ
+        L2 --> AZ
+        L3 --> AZ
+        L4 --> AZ
+        L5 --> AZ
+    end
+
+    %% ───────────────────────── TOOLS ─────────────────────────
+    subgraph TOOLS["DETERMINISTIC TOOLS (DB allow-list, no LLM math)"]
+        LOG["log_transaction<br/>overdraft projection<br/>IfMatch ETag compare-and-swap"]
+        QRY["query_transactions<br/>SUM / COUNT / AVERAGE in code<br/>getCurrentBalances() from sheet cards"]
+        CHT["generate_chart<br/>PNG"]
+        S3S["S3Service<br/>download, mutate in memory, conditional upload"]
+        LOG --> S3S
+        QRY --> S3S
+        CHT --> S3S
+    end
+
+    %% ───────────────────────── STORAGE ─────────────────────────
+    subgraph STORAGE["STORAGE"]
+        REDIS[("Redis :6380<br/>RedisSaver checkpoints by threadId<br/>agent-fox:lock:thread<br/>agent-fox:cancel:thread:request<br/>idempotency markers")]
+        PG[("PostgreSQL :5433<br/>agent_workflows<br/>tool_definitions<br/>flow_trackings")]
+        S3[("S3 / LocalStack :4566<br/>Budget_2026.xlsx<br/>month sheets, CASH TRACKER,<br/>TERMINOLOGY, balance cards<br/>FINANCIAL TRUTH")]
+    end
+
+    %% ───────────────────────── CONNECTIONS ─────────────────────────
+    WEB <-->|"POST /api/chat"| CHAT
+    WEB -.->|"recover on mount"| RECOVER
+    DC <-->|"messageCreate / reply, buttons, files"| DCS
+    CHAT --> WFS
+    DCS --> WFS
+    WFS -->|"invoke, always enters at START"| S0
+    FIN -->|"reply, chart, status"| WFS
+
+    %% graph nodes -> LLM (dotted = model call)
+    CI -.-> L1
+    PT -.-> L2
+    PCL -.-> L3
+    PEC -.-> L3
+    IQ -.-> L4
+    GA -.-> L5
+    RA -.-> L5
+    ASQ -.-> L5
+
+    %% graph nodes -> tools
+    WB --> LOG
+    RT --> QRY
+    ASQ --> QRY
+    ADS --> QRY
+    BC --> CHT
+
+    %% infra links
+    S3S <-->|"read / conditional write"| S3
+    GRAPH <-->|"checkpoint after every node"| REDIS
+    WFS <-->|"thread lock + renewal, cancel/STOP signal"| REDIS
+    CHAT <-->|"replay cached reply by requestId"| REDIS
+    WFS -->|"workflow lookup, execution tracking"| PG
+    TOOLS -.->|"tool allow-list check"| PG
+
+    %% styling
+    class WEB,DC client
+    class CHAT,RECOVER,DCS,WFS api
+    class BP,CI,RUC,PT,PB,RC,RIT,PCL,MWP,ME,WB,CB,IQ,RT,TQ,GA,RA,ZH,BC,SC,ASQ,ADS gnode
+    class RFS,RBI,VT,PEC,VQ,VA router
+    class S0,FIN terminal
+    class L1,L2,L3,L4,L5,AZ llm
+    class LOG,QRY,CHT,S3S tool
+    class REDIS,PG,S3 store
