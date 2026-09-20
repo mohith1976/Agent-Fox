@@ -7,6 +7,7 @@ import { DatabaseModule } from './database/database.module';
 import { WorkflowModule } from './workflow/workflow.module';
 import { LlmModule } from './llm/llm.module';
 import { ChatModule } from './workflow/chat/chat.module';
+import { DiscordModule } from './discord/discord.module';
 
 @Module({
   imports: [
@@ -18,6 +19,9 @@ import { ChatModule } from './workflow/chat/chat.module';
     WorkflowModule,
     LlmModule,
     ChatModule,
+    // Discord DM channel adapter (additive only — no existing route,
+    // handler, prompt or workflow touched).
+    DiscordModule,
   ],
   controllers: [AppController],
   providers: [AppService],
