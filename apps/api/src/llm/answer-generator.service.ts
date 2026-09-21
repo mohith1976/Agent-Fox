@@ -181,6 +181,7 @@ function buildUserContent(
       `Query intent: ${queryIntent}\n` +
       `Result: No transaction rows matched, but authoritative sheet balances exist.\n` +
       `${mandatoryBalanceLead(balances, balanceModes)}\n` +
+      `${combinedTotalLine(balances, balanceModes)}\n` +
       (note ? `Retrieval note (disclose this briefly in the answer): ${note}\n` : '')
     );
   }
@@ -229,15 +230,16 @@ function buildUserContent(
       `- ${mode}: debit ₹${m.debit.toLocaleString('en-IN')} / credit ₹${m.credit.toLocaleString('en-IN')} across ${m.count} transaction(s)`,
   );
 
+  const balanceOnly = !!balances && !details;
   // Balance-only payloads relabel the intent: "Query intent: SUM" with no
   // data attached reads as a broken retrieval and the model confabulates
   // about missing rows ("I don't see any transaction rows…"). BALANCE states
   // what the turn actually is.
-  const balanceOnly = !!balances && !details;
   const intentLabel = balanceOnly ? 'BALANCE' : queryIntent;
   return (
     `Query intent: ${intentLabel}\n` +
     (balances ? `${mandatoryBalanceLead(balances, balanceModes)}\n` : '') +
+    (balances ? `${combinedTotalLine(balances, balanceModes)}\n` : '') +
     (details && count > 0
       ? detailScope === 'descriptions-only'
         ? `OUTPUT COLUMNS: descriptions only — list one description per line and NOTHING else (no dates, amounts, modes, totals, or breakdowns).\n`
@@ -252,7 +254,7 @@ function buildUserContent(
     // question), the full content below applies — answering only the balance
     // half drops half the query.
     (balances && !details
-      ? `OUTPUT: reply with ONLY the balance sentence(s) above, exactly as written. No totals, no rows, no commentary about transactions.\n` +
+      ? `OUTPUT: reply with ONLY the balance sentence(s) above, exactly as written (plus the combined-total line below it when the query asks for a total/sum — otherwise omit it). No totals, no rows, no commentary about transactions.\n` +
         (note ? `Retrieval note (disclose this briefly in the answer): ${note}\n` : '')
       : `Total transactions: ${count}\n` +
         `Total debit: ₹${totalDebit.toLocaleString('en-IN')}\n` +
@@ -261,6 +263,43 @@ function buildUserContent(
         `Per-mode breakdown (report these exact numbers, grouped by mode):\n${modeLines.join('\n')}\n` +
         (note ? `Retrieval note (disclose this briefly in the answer): ${note}\n` : '') +
         `Row data:\n${JSON.stringify(sample, null, 2)}`)
+  );
+}
+
+/**
+ * Deterministic combined total over the ASKED modes (same scoping as the
+ * lead sentence — a sum over unasked modes answers a different question).
+ * Reported ONLY when the query asks for a total/sum — the model never adds,
+ * it only repeats this line. Null/unrecorded modes contribute nothing.
+ */
+export function sumWantedBalances(
+  balances: Record<string, number | null>,
+  balanceModes?: string[] | null,
+): number {
+  const wanted =
+    balanceModes && balanceModes.length > 0
+      ? balanceModes.map((m) => normalizeModeLabel(m))
+      : Object.keys(balances);
+  return wanted.reduce<number>(
+    (sum, mode) => {
+      const v = balances[mode];
+      return sum + (typeof v === 'number' && isFinite(v) ? v : 0);
+    },
+    0,
+  );
+}
+
+/**
+ * Deterministic combined-total line for the payload (see sumWantedBalances).
+ */
+function combinedTotalLine(
+  balances: Record<string, number | null>,
+  balanceModes?: string[] | null,
+): string {
+  const total = sumWantedBalances(balances, balanceModes);
+  return (
+    `Combined total (report this line ONLY if the query asks for a total, sum or combined figure):\n` +
+    `"Combined total: ₹${total.toLocaleString('en-IN')}."`
   );
 }
 

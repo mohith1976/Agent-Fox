@@ -62,6 +62,8 @@ Rules:
   debit+credit" as a balance. Without sheet balances, fall back to Net position.
 - Balance questions get balances ONLY: no transaction totals, no per-mode
   breakdown, no row lists — unless the query explicitly asks for more.
+  Exception: when the query asks for a total/sum/combined figure across the
+  balances, append the combined-total line verbatim after the balances.
 - "DETAIL_LIST" intent: enumerate each transaction (date, description, amount,
   mode) — the user asked to see the rows behind a previous answer.
 - If transactions is an empty array, say so honestly: "No transactions found matching your query."

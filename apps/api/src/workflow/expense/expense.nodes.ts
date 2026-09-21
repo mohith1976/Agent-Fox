@@ -2,6 +2,7 @@ import { Logger } from '@nestjs/common';
 import { ExpenseWorkflowState, type ExpenseWorkflowStateType, WorkflowMode, IntentType } from './expense.state';
 import { EXPENSE_CONFIG } from './expense.config';
 import { EMPTY_USAGE, type LlmUsage } from '../../llm/azure-ai.service';
+import { sumWantedBalances } from '../../llm/answer-generator.service';
 import { normalizeModeLabel } from '../excel/excel.service';
 
 /**
@@ -1545,9 +1546,56 @@ export function createExpenseNodes(deps: {
             answerFeedback: combinedMiss,
           };
         }
-        // Figures present (and rows present when asked): a balances-only
-        // answer is COMPLETE — it must not fall through to the numbers gate
-        // below (which would force transaction totals into a balance answer).
+        // Figures present — plus the combined total when the query asks for
+        // one (meaning-based: total/sum/altogether/combined; "total X
+        // balance" names the figure itself and is excluded). Same
+        // deterministic digits discipline as the balance check.
+        const asksTotal = asksCombinedTotal(state.message || '');
+        let combinedMissing = false;
+        if (asksTotal && state.retrievedBalances) {
+          // Scoped like the lead: only ASKED modes sum (a wallet the user
+          // didn't ask about must not leak into their total).
+          const combined = sumWantedBalances(
+            state.retrievedBalances,
+            state.filters?.modes,
+          );
+          const digits = String(combined).replace(/,/g, '');
+          combinedMissing = !new RegExp(
+            `\\b${escapeRegExp(digits)}\\b`,
+          ).test((state.generatedAnswer || '').replace(/,/g, ''));
+          if (combinedMissing) {
+            logger.warn(
+              `Answer omits combined total ${digits} — regenerating`,
+            );
+          }
+        }
+        if (combinedMissing) {
+          if (
+            (state.regenerationAttempt || 0) >=
+            EXPENSE_CONFIG.MAX_ANSWER_REGENERATIONS
+          ) {
+            const keepWaitingBalance =
+              state.workflowMode === WorkflowMode.PENDING_CONFIRMATION ||
+              state.workflowMode === WorkflowMode.AWAITING_CLARIFICATION;
+            return {
+              answerStatus: 'SATISFACTORY',
+              ...assistantReply(
+                state,
+                `${state.generatedAnswer} Combined total: ₹${sumWantedBalances(
+                  state.retrievedBalances || {},
+                  state.filters?.modes,
+                ).toLocaleString('en-IN')}.`,
+              ),
+              workflowMode: keepWaitingBalance ? state.workflowMode : WorkflowMode.IDLE,
+              unknownAttempts: 0,
+            };
+          }
+          return {
+            answerStatus: 'UNSATISFACTORY',
+            answerFeedback:
+              'Append the combined-total line verbatim after the balances.',
+          };
+        }
         const keepWaitingBalance =
           state.workflowMode === WorkflowMode.PENDING_CONFIRMATION ||
           state.workflowMode === WorkflowMode.AWAITING_CLARIFICATION;
@@ -2409,6 +2457,31 @@ async function answerSubList(
   return { text: parts.join('\n\n'), chartImage, usage, llmCalls, toolCalls, zeroFilters, lastFilters };
 }
 
+/**
+ * Meaning-based combined-total detector: does the query ask for a summed
+ * figure across balances ("total sum", "grand total", "altogether",
+ * "combined", "all together")? Excludes "total X balance", which names the
+ * figure itself rather than asking for a sum. No examples baked in.
+ */
+function asksCombinedTotal(message: string): boolean {
+  const text = String(message || '');
+  if (
+    /\b(sum|grand total|altogether|combined|all together)\b/i.test(text)
+  ) {
+    return true;
+  }
+  if (!/\btotal\b/i.test(text)) {
+    return false;
+  }
+  // "total bank balance" / "balance ... total" = the figure itself, not a sum.
+  if (/\btotal\s+\S+\s+balances?\b/i.test(text)) {
+    return false;
+  }
+  if (/\bbalances?\b.*\btotal\b/i.test(text)) {
+    return false;
+  }
+  return true;
+}
 /**
  * Deterministic balance sentence from sheet values. Last-resort truth when
  * the LLM drops the mandatory balance figures twice — served verbatim.
