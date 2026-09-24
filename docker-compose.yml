@@ -4,15 +4,15 @@ services:
     container_name: agent-fox-postgres
     restart: unless-stopped
     environment:
-      POSTGRES_USER: agent_fox
-      POSTGRES_PASSWORD: agent_fox_dev
-      POSTGRES_DB: agent_fox
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
     ports:
       - '5433:5432'
     volumes:
       - agent_fox_postgres_data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U agent_fox -d agent_fox"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
       interval: 5s
       timeout: 3s
       retries: 10
@@ -25,10 +25,10 @@ services:
       - '4566:4566'
     environment:
       SERVICES: s3
-      # ✅ All values read from .env — nothing hardcoded here
-      AWS_DEFAULT_REGION: ${AWS_S3_REGION:-us-east-1}
-      AWS_S3_BUCKET: ${AWS_S3_BUCKET:-agent-fox-budget}
-      AWS_S3_WORKBOOK_KEY: ${AWS_S3_WORKBOOK_KEY:-Budget_2026.xlsx}
+      # All values read from .env — bare references, no fallback literals
+      AWS_DEFAULT_REGION: ${AWS_S3_REGION}
+      AWS_S3_BUCKET: ${AWS_S3_BUCKET}
+      AWS_S3_WORKBOOK_KEY: ${AWS_S3_WORKBOOK_KEY}
       DEBUG: 0
       LOCALSTACK_AUTH_TOKEN: ${LOCALSTACK_AUTH_TOKEN}
       # ✅ Durability: persist S3 state to disk so buckets/objects survive
@@ -69,16 +69,19 @@ services:
     container_name: agent-fox-api
     restart: unless-stopped
     ports:
-      - '3009:3009'
+      - '${PORT}:3009'
     # Secrets (.env) are injected at runtime, never baked into the image
-    # (see .dockerignore). Service-DNS overrides below repoint the
-    # localhost defaults at the compose network: inside a container,
-    # localhost means itself, never the host.
+    # (see .dockerignore). Credentials/names below are bare ${VAR} references
+    # — no fallback literals, so a missing env fails loudly instead of
+    # silently running on someone's hardcoded value. Only the
+    # container-network topology (service names/ports, defined by this file
+    # itself) is literal — one variable cannot mean "localhost" for host runs
+    # and "redis" for containers at the same time.
     env_file:
       - .env
     environment:
-      PORT: 3009
-      DATABASE_URL: postgresql://agent_fox:agent_fox_dev@postgres:5432/agent_fox
+      PORT: ${PORT}
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
       AWS_S3_ENDPOINT: http://localstack:4566
       REDIS_URL: redis://redis:6379
       REDIS_HOST: redis
