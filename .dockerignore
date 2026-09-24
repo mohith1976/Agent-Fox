@@ -1,0 +1,16 @@
+# Never bake these into the image.
+node_modules
+apps/*/node_modules
+apps/*/dist
+.git
+.gitignore
+.env
+.env.local
+*.log
+coverage
+.vscode
+.windsurf
+# Live money files and local probe artifacts stay out of images.
+budgetfile
+workbooks
+*.tmp.cjs

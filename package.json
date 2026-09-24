@@ -2,11 +2,12 @@
   "name": "agent-fox",
   "version": "1.0.0",
   "main": "index.js",
-  "scripts": {
-    "test": "npm test --workspaces",
-    "dev:api": "npm run start:dev --workspace=apps/api",
-    "dev:web": "npm run dev --workspace=apps/web",
-    "build": "npm run build --workspaces",
+    "scripts": {
+      "test": "npm test --workspaces",
+      "dev:api": "npm run start:dev --workspace=apps/api",
+      "dev:web": "npm run dev --workspace=apps/web",
+      "build": "npm run build --workspaces",
+      "db:migrate": "prisma migrate deploy",
     "format": "prettier --write .",
     "format:check": "prettier --check ."
   },

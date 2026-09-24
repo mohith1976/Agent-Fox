@@ -11,6 +11,11 @@ services:
       - '5433:5432'
     volumes:
       - agent_fox_postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U agent_fox -d agent_fox"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
 
   localstack:
     image: localstack/localstack:latest
@@ -55,6 +60,42 @@ services:
       interval: 5s
       timeout: 3s
       retries: 5
+
+  api:
+    build:
+      context: .
+      dockerfile: apps/api/Dockerfile
+      target: dev
+    container_name: agent-fox-api
+    restart: unless-stopped
+    ports:
+      - '3009:3009'
+    # Secrets (.env) are injected at runtime, never baked into the image
+    # (see .dockerignore). Service-DNS overrides below repoint the
+    # localhost defaults at the compose network: inside a container,
+    # localhost means itself, never the host.
+    env_file:
+      - .env
+    environment:
+      PORT: 3009
+      DATABASE_URL: postgresql://agent_fox:agent_fox_dev@postgres:5432/agent_fox
+      AWS_S3_ENDPOINT: http://localstack:4566
+      REDIS_URL: redis://redis:6379
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      localstack:
+        condition: service_healthy
+    volumes:
+      # Hot-reload: host source overlays the baked copy; anonymous volumes
+      # keep container node_modules (Linux-built) intact.
+      - ./apps/api/src:/app/apps/api/src
+      - /app/node_modules
+      - /app/apps/api/node_modules
 
 volumes:
   agent_fox_postgres_data:
