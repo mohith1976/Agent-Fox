@@ -243,7 +243,9 @@ function buildUserContent(
     (details && count > 0
       ? detailScope === 'descriptions-only'
         ? `OUTPUT COLUMNS: descriptions only — list one description per line and NOTHING else (no dates, amounts, modes, totals, or breakdowns).\n`
-        : `ROW DETAILS REQUESTED — narrate conversationally ("You spent ₹X on A, ₹Y on B…"): fuse EACH row into ONE clause with exact figures, each fact stated ONCE (no verbatim echo plus paraphrase, no "(mode: X)"/date tags for facts the description or shared context already carries). A bare scraped list is NOT an acceptable answer here; totals alone are NOT an acceptable answer here.\n`
+        : detailScope === 'descriptions-and-amounts'
+          ? `OUTPUT COLUMNS: description + amount only — one line per row as "<description>: ₹<amount>" and NOTHING else (no dates, modes, totals, or breakdowns).\n`
+          : `ROW DETAILS REQUESTED — narrate conversationally ("You spent ₹X on A, ₹Y on B…"): fuse EACH row into ONE clause with exact figures, each fact stated ONCE (no verbatim echo plus paraphrase, no "(mode: X)"/date tags for facts the description or shared context already carries). A bare scraped list is NOT an acceptable answer here; totals alone are NOT an acceptable answer here.\n`
       : '') +
     // Balance-ONLY questions are answered from the lead sentence above — row
     // totals, breakdowns and samples are withheld so the answer stays

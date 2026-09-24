@@ -28,6 +28,12 @@ export async function seedTools(prisma: PrismaClient) {
       description: 'Creates visualization chart as PNG image',
       toolCode: 'generate_chart',
     },
+    {
+      pid: 'd4e5f6a7-b8c9-4d6e-8f0a-1b2c3d4e5f60',
+      name: 'Read Terminology',
+      description: 'Reads user-defined category word lists from TERMINOLOGY sheet',
+      toolCode: 'read_terminology',
+    },
   ];
 
   // Self-healing: remove rows left by older seed versions (e.g. toolCode 'deterministic')
@@ -44,5 +50,5 @@ export async function seedTools(prisma: PrismaClient) {
     skipDuplicates: true,
   });
 
-  console.log('✓ Seeded 3 tools: log_transaction, query_transactions, generate_chart');
+  console.log('✓ Seeded 4 tools: log_transaction, query_transactions, generate_chart, read_terminology');
 }

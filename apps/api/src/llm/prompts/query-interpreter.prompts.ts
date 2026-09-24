@@ -15,7 +15,9 @@ Convert natural language queries into structured filter parameters.
 Today's date: ${todayISO}
 
 Available sheets — use these EXACT names, never decorated or invented:
-"SEPTEMBER" (PhonePay/Wallet rows), "CASH TRACKER" (Money/Bank rows).
+month sheets named by month ("OCTOBER", "NOVEMBER", … — the book rolls
+monthly, so ANY month name is a valid sheet) plus "CASH TRACKER"
+(Money/Bank rows). PhonePe/Wallet rows live in their transaction month.
 Payment modes: PHONEPAY, WALLET, MONEY, BANK
 Categories: AVOID_EXPENSE, PAY_HOME_CASH, PERSONAL_EXPENSE, HOME_EXPENSE, WISHLIST_EXPENSE
 
@@ -25,7 +27,13 @@ Date interpretation (rolling windows, NEVER calendar weeks):
   trailing 7 days ending today (dateFrom = today − 6 days, dateTo = today).
   "Last week" is NOT Monday–Sunday — it is identical to "last 7 days".
 - "last 3 days" → trailing 3 days ending today.
-- "September" → September ${year}
+- Any month name ("September", "october", "last month") → that month's sheet
+  (UPPERCASE month name) with that month's dates; Money/Bank rows of that
+  month ride along automatically; never invent sheets.
+- NO period and NO sheet in the question ("my transactions", "total
+  transactions", "count phonepay transactions") → the CURRENT month (this
+  month's dates and sheet). Bare transaction questions are never all-time.
+  "Current"/all-time scope applies ONLY to balance questions.
 
 Common queries:
 - "how much did I spend this month?" → aggregate SUM on debit, filter current month
@@ -48,10 +56,25 @@ Category mapping (IMPORTANT — color codes are sparse in real books):
 - Most everyday rows are uncolored; filtering them by PERSONAL_EXPENSE would
   wrongly return zero results.
 
+Terminology lists vs transactions (two different questions — never confuse):
+- List-words WITHOUT transaction nouns ("what is my wishlist", "show my
+  personal list", "for-home items", "my wishlist", "list my lists") →
+  terminologyList: "WISHLIST" / "PERSONAL" / "FOR_HOME" ("show my lists"
+  or bare plural ambiguity → "ALL"). These ask for the USER'S OWN WORDS
+  from the TERMINOLOGY sheet — not rows.
+- Transaction nouns ("transactions", "expenses", "spending", "spent", "total",
+  "how much", "show me", "list" + a money scope) → terminologyList: null
+  and use the categories filter as usual (colored rows).
+- "wishlist expenses" / "my wishlist transactions" → transactions
+  (categories: [WISHLIST_EXPENSE]), never the word list.
+
 Mode mapping:
 - "savings" / "bank" / "account" → BANK (savings live in CASH TRACKER as BANK).
 - "cash" / "money" → MONEY. "phonepe/phonepay/upi/gpay" → PHONEPAY.
   "wallet/paytm/card" → WALLET.
+- Column restriction wins over mode words: when "money"/"amount" appears
+  inside an output-column restriction ("desc and money only", "description
+  and amount only"), it names a COLUMN — do not set a mode filter from it.
 
 Balance questions (read sheet balances, NEVER transaction sums):
 - "balance", "current X balance", "how much money is there", "how much is
@@ -176,6 +199,12 @@ export const QUERY_INTERPRETATION_SCHEMA = {
       description:
         'True when the query asks to see/list/describe individual transactions; the answer enumerates rows, not just totals',
     },
+    terminologyList: {
+      type: ['string', 'null'] as any,
+      enum: ['WISHLIST', 'PERSONAL', 'FOR_HOME', 'ALL', null],
+      description:
+        'Set when the query asks for the user-defined TERMINOLOGY word lists themselves (not transactions); null for transaction questions',
+    },
     reasoning: {
       type: 'string' as const,
     },
@@ -189,6 +218,7 @@ export const QUERY_INTERPRETATION_SCHEMA = {
     'limit',
     'wantsBalances',
     'wantsDetails',
+    'terminologyList',
     'reasoning',
   ],
   additionalProperties: false,

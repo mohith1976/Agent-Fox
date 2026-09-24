@@ -66,6 +66,13 @@ export interface QueryTransactionsInput {
    * authoritative and must NOT be recomputed from transactions.
    */
   includeBalances?: boolean;
+  /**
+   * Set by the workflow when the user EXPLICITLY named a single month.
+   * Balance reads then answer from that month's own closings (see
+   * getMonthClosingBalances), never the current month. Default-scoped and
+   * broadened turns leave it unset (global current balances).
+   */
+  monthExplicit?: boolean;
 }
 
 /**
@@ -109,4 +116,24 @@ export interface GenerateChartOutput {
   mimeType: string; // 'image/png'
   width: number;
   height: number;
+}
+
+/**
+ * Input for read_terminology tool.
+ * No filters needed — the tool always returns all three user-defined lists
+ * (the caller selects which to present).
+ */
+export interface ReadTerminologyInput {
+  s3KeyOverride?: string;
+}
+
+/**
+ * Output from read_terminology tool.
+ * The user's own words from the TERMINOLOGY sheet (rows 15-17, cols H-J):
+ * the rulebook for category coloring. Served verbatim for list questions.
+ */
+export interface ReadTerminologyOutput {
+  forHome: string[];
+  personal: string[];
+  wishlist: string[];
 }

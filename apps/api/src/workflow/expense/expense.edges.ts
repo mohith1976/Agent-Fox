@@ -231,8 +231,22 @@ export const ExpenseEdges = {
   // ========================================
 
   /**
+   * Route after query interpretation.
+   *
+   * - terminologyList set → read_terminology_lists (the WORDS themselves;
+   *   retrieval would answer a different question with colored rows)
+   * - otherwise → retrieve_transactions (normal analytical path)
+   */
+  routeAfterInterpret: (state: ExpenseWorkflowStateType): string => {
+    if (state.terminologyListRequested) {
+      return 'read_terminology_lists';
+    }
+    return 'retrieve_transactions';
+  },
+
+  /**
    * Route after query result validation
-   * 
+   *
    * - SUFFICIENT → generate_answer
    * - INSUFFICIENT → transform_query (with bounded retry)
    * - Max attempts reached → inform_user_insufficient

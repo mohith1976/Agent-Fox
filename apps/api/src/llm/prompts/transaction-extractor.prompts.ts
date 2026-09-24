@@ -15,6 +15,13 @@ Payment modes:
 - MONEY: Cash
 - BANK: Bank transfer
 
+Mode signals (read, don't ask): a named app, account, or channel marker in the
+message IS the mode — a method named via "X account" or "on/by/via/through X"
+resolves to that method, even when generic funds-words appear elsewhere in the
+same text (funds-words name what moves, not how). Only treat mode as
+missing/ambiguous when NO method is named or two DIFFERENT methods actually
+compete.
+
 Direction:
 - DEBIT: Money going out (expenses, payments)
 - CREDIT: Money coming in (income, refunds, receipts)

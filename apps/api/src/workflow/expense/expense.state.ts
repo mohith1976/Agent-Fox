@@ -412,6 +412,16 @@ export const ExpenseWorkflowState = Annotation.Root({
     default: () => false,
   }),
 
+  /** Whether the user EXPLICITLY named a single month for this query (LLM
+   * sheets carried a month name before any default was applied). Drives
+   * month-scoped balance reads ("september closing balance" → september's
+   * own closings, never the current month's). Default-scoped turns leave it
+   * false so plain "closing balance" stays global-current. */
+  monthExplicit: Annotation<boolean>({
+    reducer: (_, value) => value,
+    default: () => false,
+  }),
+
   /** Whether the user asked for a chart (forwarded to build_chart). */
   chartRequested: Annotation<boolean>({
     reducer: (_, value) => value,
@@ -424,6 +434,19 @@ export const ExpenseWorkflowState = Annotation.Root({
   detailsRequested: Annotation<boolean>({
     reducer: (_, value) => value,
     default: () => false,
+  }),
+
+  /** Terminology list asked for (WISHLIST/PERSONAL/FOR_HOME/ALL), or null
+   * for transaction questions. The WORDS themselves, never colored rows. */
+  terminologyListRequested: Annotation<string | null>({
+    reducer: (_, value) => value,
+    default: () => null,
+  }),
+
+  /** Terminology lists read from the sheet (for list answers). */
+  terminologyLists: Annotation<any>({
+    reducer: (_, value) => value,
+    default: () => null,
   }),
 
   /** Segmented sub-requests for combinational turns
@@ -594,9 +617,12 @@ export function createInitialState(
     retrievalCount: 0,
     retrievedBalances: null,
     balanceRequested: false,
+    monthExplicit: false,
     chartRequested: false,
     chartType: null,
     detailsRequested: false,
+    terminologyListRequested: null,
+    terminologyLists: null,
     subRequests: null,
     pendingSubs: [],
     broadenOffered: false,

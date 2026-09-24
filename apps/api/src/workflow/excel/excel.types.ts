@@ -82,7 +82,12 @@ export interface TerminologyData {
  * Transaction filters for queries
  */
 export interface TransactionFilters {
-  sheets?: string[];
+  /**
+   * Month sheets to read (plus CASH TRACKER where relevant). Explicit null =
+   * consent-broadened all-time read (every month sheet); undefined/empty =
+   * interpreter default (current month + CASH TRACKER).
+   */
+  sheets?: string[] | null;
   modes?: PaymentMode[];
   categories?: CategoryColor[];
   dateFrom?: string;
