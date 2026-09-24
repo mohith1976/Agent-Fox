@@ -2,6 +2,7 @@ import { Logger } from '@nestjs/common';
 import { ExpenseWorkflowState, type ExpenseWorkflowStateType, WorkflowMode, IntentType } from './expense.state';
 import { EXPENSE_CONFIG } from './expense.config';
 import { EMPTY_USAGE, type LlmUsage } from '../../llm/azure-ai.service';
+import { sumWantedBalances } from '../../llm/answer-generator.service';
 import { normalizeModeLabel } from '../excel/excel.service';
 
 /**
@@ -165,6 +166,10 @@ export function createExpenseNodes(deps: {
         // same-day result).
         chartImage: null,
         queryNote: null,
+        // Terminology answers are per-turn: a stale list request must never
+        // leak into a fresh query (same checkpoint family as chart/error).
+        terminologyListRequested: null,
+        terminologyLists: null,
         // A fresh user turn consumes or voids any outstanding broaden offer:
         // only routeFromStart's explicit affirmation path may act on it.
         broadenOffered: false,
@@ -1193,6 +1198,34 @@ export function createExpenseNodes(deps: {
         logger.log('Balance question detected deterministically — forcing sheet-balance read');
       }
 
+      // No-period rule (owner's standing instruction — see
+      // applyNoPeriodDefault): a transaction question with NO date frame and
+      // NO sheet scope means the CURRENT month, never all-time.
+      const scoped = applyNoPeriodDefault(filters, {
+        aggregation,
+        balanceRequested,
+        wantsDetails: !!result.wantsDetails,
+      });
+      const queryNote: string | null = scoped.queryNote;
+      if (scoped.queryNote) {
+        logger.log(`No-period default applied: ${JSON.stringify(filters.sheets)} scope`);
+      }
+
+      // Column-vs-mode disambiguation (deterministic backstop for the prompt
+      // rule above): "desc and money only" names OUTPUT COLUMNS — a lone
+      // MONEY mode filter born from that same "money" would zero the query.
+      // Dropped only in the combined column scope; every other mode reading
+      // ("money transactions", "cash spending") keeps its filter.
+      if (
+        detailScopeFor(state.message, !!result.wantsDetails) ===
+          'descriptions-and-amounts' &&
+        (filters.modes || []).length === 1 &&
+        String(filters.modes[0]).toUpperCase().replace(/\s+/g, '') === 'MONEY'
+      ) {
+        logger.log('Column-scope backstop: dropping lone MONEY mode filter');
+        filters.modes = [];
+      }
+
       // Broaden-on-consent return: previous scope (modes/categories/sheets)
       // with the newly interpreted (or dropped) dates. Bare "broaden it"
       // carries old filters and drops dates; "broaden it for 2 weeks"
@@ -1219,6 +1252,8 @@ export function createExpenseNodes(deps: {
           chartRequested: !!result.chartRequested,
           chartType: result.chartType || null,
           detailsRequested: !!result.wantsDetails,
+          // Broaden widens everything: no named-month balance scoping.
+          monthExplicit: false,
           ...countLlm(state, result.usage),
         };
       }
@@ -1236,6 +1271,15 @@ export function createExpenseNodes(deps: {
         chartType: result.chartType || null,
         // Row-detail shaping only — never changes filters/aggregation.
         detailsRequested: !!result.wantsDetails,
+        // Terminology WORDS vs transactions: a list request routes away
+        // from retrieval entirely (see routeAfterInterpret).
+        terminologyListRequested: result.terminologyList || null,
+        // Assumed-scope disclosure ("no period → this month"); null keeps
+        // prior turns' notes untouched downstream.
+        queryNote,
+        // Explicitly-named month (pre-default LLM sheets): drives
+        // month-scoped balance reads downstream.
+        monthExplicit: explicitMonthSheets(result.filters?.sheets).length > 0,
         ...countLlm(state, result.usage),
       };
     },
@@ -1261,12 +1305,14 @@ export function createExpenseNodes(deps: {
           // Balance questions also fetch authoritative sheet balances
           // (last-row running balances — never recomputed from rows).
           ...(state.balanceRequested ? { includeBalances: true } : {}),
+          // Explicitly-named month → that month's own closings downstream.
+          ...(state.monthExplicit ? { monthExplicit: true } : {}),
         },
         allowedToolCodes,
       );
 
       return {
-        retrievedTransactions: result.transactions || [],
+        retrievedTransactions: orderForAnswer(result.transactions || []),
         retrievalCount:
           result.aggregation?.count ?? result.count ?? result.transactions?.length ?? 0,
         retrievedBalances: result.balances || null,
@@ -1332,15 +1378,19 @@ export function createExpenseNodes(deps: {
     broaden_previous: async (
       state: ExpenseWorkflowStateType,
     ): Promise<Partial<ExpenseWorkflowStateType>> => {
-      // Broaden consent CONSUMED: re-run the previous scope dateless (modes,
-      // categories, sheets, limit and aggregation intent all preserved).
-      // Terminates: afterwards there are no dates left to drop, so a further
+      // Broaden consent CONSUMED: re-run previous scope dateless AND
+      // sheetless (modes, categories, limit and aggregation intent all
+      // preserved). "Yes" after a zero-hit means ALL transactions — keeping
+      // sheets would silently keep the old scope (and the tool would re-add
+      // month dates for month sheets), defeating the consent.
+      // Terminates: afterwards there is nothing left to drop, so a further
       // "yes" finds no widenable scope and falls through to classification.
       const prior = state.filters || {};
-      logger.log('Broaden consent consumed — re-running previous scope dateless');
+      logger.log('Broaden consent consumed — re-running all-time (dates and sheets dropped)');
       return {
         filters: {
           ...prior,
+          sheets: null,
           dateFrom: null,
           dateTo: null,
         },
@@ -1377,6 +1427,41 @@ export function createExpenseNodes(deps: {
       };
     },
 
+    read_terminology_lists: async (
+      state: ExpenseWorkflowStateType,
+    ): Promise<Partial<ExpenseWorkflowStateType>> => {
+      logger.log('Reading terminology word lists');
+      const result = await toolExecutor.execute(
+        'read_terminology',
+        {},
+        allowedToolCodes,
+      );
+      return {
+        terminologyLists: {
+          forHome: result.forHome || [],
+          personal: result.personal || [],
+          wishlist: result.wishlist || [],
+        },
+        ...countTool(state),
+      };
+    },
+
+    generate_terminology_answer: async (
+      state: ExpenseWorkflowStateType,
+    ): Promise<Partial<ExpenseWorkflowStateType>> => {
+      // No LLM: a word list has exactly one correct rendering (the user's
+      // own words). Deterministic, stable across turns, zero cost.
+      const text = formatTerminologyLists(
+        state.terminologyLists,
+        state.terminologyListRequested,
+      );
+      return {
+        ...assistantReply(state, text),
+        workflowMode: WorkflowMode.IDLE,
+        unknownAttempts: 0,
+      };
+    },
+
     generateAnswer: async (
       state: ExpenseWorkflowStateType,
     ): Promise<Partial<ExpenseWorkflowStateType>> => {
@@ -1407,8 +1492,22 @@ export function createExpenseNodes(deps: {
         detailScope,
       });
 
+      // Assumed-scope disclosure is guaranteed, not LLM-dependent: when the
+      // turn carried a retrieval note (no-period default, broaden, too-broad
+      // cap) and the draft doesn't already carry its essence, append it
+      // verbatim. The user must always see WHAT scope was actually computed.
+      let finalText = result.text;
+      if (state.queryNote) {
+        const norm = (s: string) =>
+          s.toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
+        const essence = norm(state.queryNote).slice(0, 30);
+        if (essence && !norm(finalText).includes(essence)) {
+          finalText = `${finalText}\n\nNote: ${state.queryNote}`;
+        }
+      }
+
       return {
-        generatedAnswer: result.text,
+        generatedAnswer: finalText,
         includesAggregation: result.hasNumbers,
         ...countLlm(state, result.usage),
       };
@@ -1471,12 +1570,51 @@ export function createExpenseNodes(deps: {
           missing.length === 0 &&
           (state.generatedAnswer || '').length > 20
         ) {
+          // Column scopes ("desc only", "desc and money only") forbid
+          // everything but the per-row lines: a totals/breakdown tail is a
+          // scope leak — regenerate without it (bounded, like all regens).
+          const scope = detailScopeFor(state.message, detailsMode);
+          if (
+            (scope === 'descriptions-only' ||
+              scope === 'descriptions-and-amounts') &&
+            /(total|net position|per-mode|breakdown|\bdebit\b|\bcredit\b)/i.test(
+              state.generatedAnswer || '',
+            )
+          ) {
+            return (
+              `Output ONLY the per-row lines (description` +
+              (scope === 'descriptions-and-amounts' ? ' and amount' : '') +
+              `, one per line) — remove every totals, per-mode and ` +
+              `breakdown line; they violate the requested columns.`
+            );
+          }
           return null;
         }
+        // Imperative and unquotable: earlier "N missing (e.g. X)" phrasing
+        // was narrated back ("X is missing from the retrieved rows").
+        // Column scopes enumerate rows ONLY — no totals tail invited.
+        // Rewrite discipline (all details regens): the previous draft is
+        // DISCARDED, not extended — missed rows were APPENDED below ordered
+        // rows, which is exactly the jumble ("ordered block, then stragglers")
+        // the owner caught. The replacement lists EVERY row in the payload's
+        // given order (newest-first for last/latest queries), one per line.
+        const scope = detailScopeFor(state.message, detailsMode);
+        if (
+          scope === 'descriptions-only' ||
+          scope === 'descriptions-and-amounts'
+        ) {
+          return (
+            `DISCARD the previous draft entirely. Re-list EVERY row from the ` +
+            `payload in its given order, one per line with description` +
+            (scope === 'descriptions-and-amounts' ? ' and amount' : '') +
+            ` and NOTHING else — no totals, no breakdowns, no appended extras.`
+          );
+        }
         return (
-          `List every retrieved transaction (date, description, amount, mode) ` +
-          `— ${missing.length} missing (e.g. ${missing.slice(0, 3).join(', ')}). ` +
-          `Then close with the one-line totals summary.`
+          `DISCARD the previous draft entirely. Re-list EVERY row from the ` +
+          `payload in its given order, one per line with description and ` +
+          `amount; then the one-line totals summary. Never append missing ` +
+          `rows below an old draft — always replace the whole answer.`
         );
       };
 
@@ -1545,9 +1683,56 @@ export function createExpenseNodes(deps: {
             answerFeedback: combinedMiss,
           };
         }
-        // Figures present (and rows present when asked): a balances-only
-        // answer is COMPLETE — it must not fall through to the numbers gate
-        // below (which would force transaction totals into a balance answer).
+        // Figures present — plus the combined total when the query asks for
+        // one (meaning-based: total/sum/altogether/combined; "total X
+        // balance" names the figure itself and is excluded). Same
+        // deterministic digits discipline as the balance check.
+        const asksTotal = asksCombinedTotal(state.message || '');
+        let combinedMissing = false;
+        if (asksTotal && state.retrievedBalances) {
+          // Scoped like the lead: only ASKED modes sum (a wallet the user
+          // didn't ask about must not leak into their total).
+          const combined = sumWantedBalances(
+            state.retrievedBalances,
+            state.filters?.modes,
+          );
+          const digits = String(combined).replace(/,/g, '');
+          combinedMissing = !new RegExp(
+            `\\b${escapeRegExp(digits)}\\b`,
+          ).test((state.generatedAnswer || '').replace(/,/g, ''));
+          if (combinedMissing) {
+            logger.warn(
+              `Answer omits combined total ${digits} — regenerating`,
+            );
+          }
+        }
+        if (combinedMissing) {
+          if (
+            (state.regenerationAttempt || 0) >=
+            EXPENSE_CONFIG.MAX_ANSWER_REGENERATIONS
+          ) {
+            const keepWaitingBalance =
+              state.workflowMode === WorkflowMode.PENDING_CONFIRMATION ||
+              state.workflowMode === WorkflowMode.AWAITING_CLARIFICATION;
+            return {
+              answerStatus: 'SATISFACTORY',
+              ...assistantReply(
+                state,
+                `${state.generatedAnswer} Combined total: ₹${sumWantedBalances(
+                  state.retrievedBalances || {},
+                  state.filters?.modes,
+                ).toLocaleString('en-IN')}.`,
+              ),
+              workflowMode: keepWaitingBalance ? state.workflowMode : WorkflowMode.IDLE,
+              unknownAttempts: 0,
+            };
+          }
+          return {
+            answerStatus: 'UNSATISFACTORY',
+            answerFeedback:
+              'Append the combined-total line verbatim after the balances.',
+          };
+        }
         const keepWaitingBalance =
           state.workflowMode === WorkflowMode.PENDING_CONFIRMATION ||
           state.workflowMode === WorkflowMode.AWAITING_CLARIFICATION;
@@ -1971,7 +2156,7 @@ const BALANCE_QUESTION_RE =
  * (income)") — offering words the parser can't hear re-asks forever.
  */
 const CREDIT_SIGNALS =
-  /\breceived\b|\brefund\b|\bsalary\b|\bstipend\b|\bincome\b|\bincoming\b|\bcoming\s?in\b|\bcredited?\b|\bcashback\b|\brewards?\b|\bpaid\s+back\b|\bgot\b.{0,20}\b(from|back)\b/i;
+  /\breceived\b|\brefund\b|\bsalary\b|\bstipend\b|\bincome\b|\bincoming\b|\bcoming\s?in\b|\bcredited?\b|\bcashback\b|\brewards?\b|\bpaid\s+back\b|\breturn(ed)?\b.{0,20}\bfrom\b|\breimburs(e|ed|ement)\b|\bchargeback\b|\bgot\b.{0,20}\b(from|back)\b/i;
 
 /**
  * Debit signals: words indicating money went OUT (the common case).
@@ -1980,7 +2165,7 @@ const CREDIT_SIGNALS =
  * question's words, is ignored and the question repeats.
  */
 const DEBIT_SIGNALS =
-  /\bpaid\b|\bspent\b|\bbought\b|\bpay\b|\bexpense\b|\bgoing\s?out\b|\boutgoing\b|\bout\b|\bdebit\b|\bdebited\b|\bsent\b|\blent\b|\bwithdraw\b/i;
+  /\bpaid\b|\bspent\b|\bbought\b|\bpay\b|\bexpense\b|\bgoing\s?out\b|\boutgoing\b|\bout\b|\bdebit\b|\bdebited\b|\bsent\b|\blent\b|\bwithdraw\b|\breturn(ed)?\b.{0,20}\bto\b/i;
 
 /**
  * Payment-mode keywords for the deterministic ambiguity guard.
@@ -1989,7 +2174,7 @@ const DEBIT_SIGNALS =
  * savings" must stay a clean single-mode (BANK) extraction.
  */
 const MODE_KEYWORDS: Record<string, RegExp> = {
-  PHONEPAY: /\b(phone\s?pay|phonepe|phnpe|gpay|google\s?pay|upi)\b/i,
+  PHONEPAY: /\b(phone\s?pay|phone\s?pe|phonepe|phnpe|gpay|google\s?pay|upi)\b/i,
   MONEY: /\b(money|cash)\b/i,
   WALLET: /\b(wallet|paytm)\b/i,
   BANK: /\b(bank|savings?|account|card|netbanking|neft|imps)\b/i,
@@ -1999,11 +2184,38 @@ const MODE_KEYWORDS: Record<string, RegExp> = {
  * Which distinct payment modes does the raw user message name?
  * 0 = none mentioned (extractor default applies), 1 = unambiguous,
  * 2+ = ambiguous → validate_transaction_data forces clarification.
+ * "X account" belongs to X: "phone pe account" is PHONEPAY's account, not a
+ * bank signal — the bare-"account" BANK hit yields when an app/wallet word
+ * sits next to "account". Bare "account" alone still counts as BANK.
  */
 function detectMentionedModes(message: string): string[] {
-  return Object.entries(MODE_KEYWORDS)
+  const found = Object.entries(MODE_KEYWORDS)
     .filter(([, re]) => re.test(message))
     .map(([mode]) => mode);
+  if (
+    found.includes('BANK') &&
+    /(phone\s?pe|phone\s?pay|phonepe|phnpe|upi|gpay|google\s?pay|wallet|paytm)\s+(accounts?|acc\b)/i.test(
+      message,
+    )
+  ) {
+    return found.filter((m) => m !== 'BANK');
+  }
+  // Funds-word demotion: bare "money"/"cash" as the THING MOVING is not a
+  // mode claim when another mode is present ("money returned ... on phonepe"
+  // moves funds via PHONEPAY — it is not a cash payment). "money"/"cash"
+  // still counts when amount-attached ("1420 cash", "cash 1420") or
+  // instrument-marked ("by cash", "in cash", "with money", "via cash"):
+  // "100 cash by phonepe" stays genuinely ambiguous and still asks.
+  if (
+    found.includes('MONEY') &&
+    found.length > 1 &&
+    !/(\d+\s*(rs|₹|inr|k)?\s*(money|cash)\b|\b(money|cash)\s*\d+|\b(by|via|with|through|in|using)\s+(money|cash)\b)/i.test(
+      message,
+    )
+  ) {
+    return found.filter((m) => m !== 'MONEY');
+  }
+  return found;
 }
 
 /**
@@ -2134,15 +2346,106 @@ function escapeRegExp(text: string): string {
 }
 
 /**
+ * Month names explicitly present in an LLM-emitted sheets list (UPPER).
+ * Detects user-named months BEFORE any default scope is applied.
+ */
+function explicitMonthSheets(sheets: unknown): string[] {
+  const months = [
+    'JANUARY', 'FEBRUARY', 'MARCH', 'APRIL', 'MAY', 'JUNE',
+    'JULY', 'AUGUST', 'SEPTEMBER', 'OCTOBER', 'NOVEMBER', 'DECEMBER',
+  ];
+  if (!Array.isArray(sheets)) {
+    return [];
+  }
+  return sheets
+    .map((s) => String(s).toUpperCase())
+    .filter((s) => months.includes(s));
+}
+
+/**
+ * No-period default (owner's standing instruction): a transaction question
+ * with NO date frame and NO sheet scope means the CURRENT month — never
+ * all-time ("just transactions" in september is september, not the whole
+ * book). Mutates and returns the passed filters plus a disclosure note.
+ * Exempt: latest-only lookups (limit, no other scope — newest ever), and
+ * balance-led turns without row details (balances are global current by
+ * definition). Consent-broadened ("yes") turns bypass interpretation, so
+ * widened scope stays widened.
+ */
+function applyNoPeriodDefault(
+  filters: any,
+  opts: { aggregation: any; balanceRequested: boolean; wantsDetails: boolean },
+): { queryNote: string | null } {
+  const now = new Date();
+  const months = [
+    'JANUARY', 'FEBRUARY', 'MARCH', 'APRIL', 'MAY', 'JUNE',
+    'JULY', 'AUGUST', 'SEPTEMBER', 'OCTOBER', 'NOVEMBER', 'DECEMBER',
+  ];
+  const cur = months[now.getMonth()];
+  const title = cur.charAt(0) + cur.slice(1).toLowerCase();
+  const noDates = !filters.dateFrom && !filters.dateTo;
+  const noSheets = !filters.sheets || filters.sheets.length === 0;
+  const hasOtherScope =
+    (filters.modes?.length || 0) > 0 ||
+    (filters.categories?.length || 0) > 0 ||
+    !!filters.descriptionContains ||
+    (filters.tags?.length || 0) > 0;
+  const latestOnly =
+    (filters.limit ?? null) !== null && !hasOtherScope && !opts.aggregation;
+  const balanceLedNoDetails =
+    opts.balanceRequested && !opts.aggregation && !opts.wantsDetails;
+  if (!(noDates && noSheets) || latestOnly || balanceLedNoDetails) {
+    return { queryNote: null };
+  }
+  const pad = (n: number) => String(n).padStart(2, '0');
+  const lastDay = new Date(now.getFullYear(), now.getMonth() + 1, 0).getDate();
+  const mm = pad(now.getMonth() + 1);
+  filters.dateFrom = `${now.getFullYear()}-${mm}-01`;
+  filters.dateTo = `${now.getFullYear()}-${mm}-${pad(lastDay)}`;
+  filters.sheets = [cur, 'CASH TRACKER'];
+  return {
+    queryNote: `No period mentioned — showing ${title} ${now.getFullYear()} (this month).`,
+  };
+}
+
+/**
+ * Answer order for row-detail turns: ALWAYS newest-first. Reads arrive grouped
+ * by sheet (month-sheet block, then CASH TRACKER block), so any multi-sheet
+ * answer without sorting jumbles dates ("past 3 days" ended with September-21
+ * bank rows below September-23 rows). One rule, no per-query special cases:
+ * details list newest-first, totals still run over the full set. Returns a NEW
+ * array — never mutates state in place. Same-day ties keep stable sheet order
+ * (deterministic); undated rows sink last.
+ */
+function orderForAnswer(transactions: any[]): any[] {
+  if (!Array.isArray(transactions) || transactions.length < 2) {
+    return transactions;
+  }
+  const timeOf = (t: any): number => {
+    const d = t?.date instanceof Date ? t.date : new Date(t?.date);
+    const ms = d instanceof Date ? d.getTime() : NaN;
+    return isNaN(ms) ? -Infinity : ms;
+  };
+  return [...transactions].sort((a, b) => timeOf(b) - timeOf(a));
+}
+
+/**
  * Deterministic detail-column scoping. A query restricting the answer to
  * descriptions ("description only", "just the reasons") is answered with one
- * description per line and NOTHING else. Meaning-based (restrictor +
+ * description per line and NOTHING else; "desc and money/amount only" yields
+ * description + amount per line and NOTHING else. Meaning-based (restrictor +
  * column words), never example-based.
  */
 function detailScopeFor(message: unknown, details: boolean): string | null {
   if (!details) return null;
   const text = String(message || '');
-  if (/\bdescriptions?\b/i.test(text) && /\b(only|just)\b/i.test(text)) {
+  const restrictor = /\b(only|just)\b/i.test(text);
+  const descWords = /\bdesc(riptions?)?\b/i.test(text);
+  const amountWords = /\b(amounts?|money|rupees?|\brs\b|₹|inr)\b/i.test(text);
+  if (restrictor && descWords && amountWords) {
+    return 'descriptions-and-amounts';
+  }
+  if (descWords && restrictor) {
     return 'descriptions-only';
   }
   return null;
@@ -2173,9 +2476,11 @@ interface PlannedSub {
   aggregation: { type: 'SUM' | 'COUNT' | 'AVERAGE'; field: string } | null;
   timeRange: { dateFrom: any; dateTo: any };
   balanceRequested: boolean;
+  monthExplicit: boolean;
   chartRequested: boolean;
   chartType: string | null;
   detailsRequested: boolean;
+  terminologyList: string | null;
   usage: LlmUsage;
 }
 
@@ -2217,6 +2522,8 @@ async function planAnalyticalSub(
     chartRequested: !!result.chartRequested,
     chartType: result.chartType || null,
     detailsRequested: !!result.wantsDetails,
+    terminologyList: result.terminologyList || null,
+    monthExplicit: explicitMonthSheets(result.filters?.sheets).length > 0,
     usage: result.usage,
   };
 }
@@ -2290,25 +2597,71 @@ async function answerAnalyticalSub(
     totalTokens: plan.usage?.totalTokens || 0,
   };
 
+  // Terminology WORDS (not transactions): deterministic read + format, no
+  // LLM answer call. Same split as the main path (routeAfterInterpret).
+  if (plan.terminologyList) {
+    const lists = await deps.toolExecutor.execute(
+      'read_terminology',
+      {},
+      deps.allowedToolCodes,
+    );
+    toolCalls++;
+    const text = formatTerminologyLists(
+      {
+        forHome: lists.forHome || [],
+        personal: lists.personal || [],
+        wishlist: lists.wishlist || [],
+      },
+      plan.terminologyList,
+    );
+    return {
+      text,
+      chartImage: null,
+      usage,
+      llmCalls,
+      toolCalls,
+      count: 0,
+      filters: plan.filters,
+    };
+  }
+
   // Retrieve (mirrors retrieveTransactions core: timeRange fallback dates,
-  // forwarded aggregation, authoritative balances on demand).
+  // forwarded aggregation, authoritative balances on demand). Combo subs
+  // obey the same no-period rule as single turns (current-month default).
   const filters = {
     ...(plan.filters || {}),
     dateFrom:
       plan.filters?.dateFrom ?? plan.timeRange?.dateFrom ?? undefined,
     dateTo: plan.filters?.dateTo ?? plan.timeRange?.dateTo ?? undefined,
   };
+  const scoped = applyNoPeriodDefault(filters, {
+    aggregation: plan.aggregation,
+    balanceRequested: !!plan.balanceRequested,
+    wantsDetails: !!plan.detailsRequested,
+  });
+
+  // Same column-vs-mode backstop as the single path (see interpretQuery).
+  if (
+    detailScopeFor(subText, !!plan.detailsRequested) ===
+      'descriptions-and-amounts' &&
+    (filters.modes || []).length === 1 &&
+    String(filters.modes[0]).toUpperCase().replace(/\s+/g, '') === 'MONEY'
+  ) {
+    filters.modes = [];
+  }
   const qres = await deps.toolExecutor.execute(
     'query_transactions',
     {
       filters,
       ...(plan.aggregation ? { aggregation: plan.aggregation } : {}),
       ...(plan.balanceRequested ? { includeBalances: true } : {}),
+      ...(plan.monthExplicit ? { monthExplicit: true } : {}),
     },
     deps.allowedToolCodes,
   );
   toolCalls++;
-  const txns = qres.transactions || [];
+  // Same newest-first answer ordering as the single path.
+  const txns = orderForAnswer(qres.transactions || []);
   const count =
     qres.aggregation?.count ?? qres.count ?? txns.length ?? 0;
 
@@ -2332,7 +2685,7 @@ async function answerAnalyticalSub(
     queryIntent: plan.queryIntent,
     workflowPrompt: deps.workflowPrompt,
     count,
-    note: undefined,
+    note: scoped.queryNote ?? undefined,
     balances: qres.balances || undefined,
     balanceModes:
       plan.filters?.modes && plan.filters.modes.length > 0
@@ -2410,6 +2763,56 @@ async function answerSubList(
 }
 
 /**
+ * Meaning-based combined-total detector: does the query ask for a summed
+ * figure across balances ("total sum", "grand total", "altogether",
+ * "combined", "all together")? Excludes "total X balance", which names the
+ * figure itself rather than asking for a sum. No examples baked in.
+ */
+function asksCombinedTotal(message: string): boolean {
+  const text = String(message || '');
+  if (
+    /\b(sum|grand total|altogether|combined|all together)\b/i.test(text)
+  ) {
+    return true;
+  }
+  if (!/\btotal\b/i.test(text)) {
+    return false;
+  }
+  // "total bank balance" / "balance ... total" = the figure itself, not a sum.
+  if (/\btotal\s+\S+\s+balances?\b/i.test(text)) {
+    return false;
+  }
+  if (/\bbalances?\b.*\btotal\b/i.test(text)) {
+    return false;
+  }
+  return true;
+}
+/**
+ * Deterministic terminology-list answer: the user's own words, joined.
+ * No LLM — a word list has one correct rendering. Scoped to the asked
+ * list; ALL prints all three lines.
+ */
+function formatTerminologyLists(
+  lists: { forHome?: string[]; personal?: string[]; wishlist?: string[] } | null,
+  which: string | null,
+): string {
+  const forHome = lists?.forHome || [];
+  const personal = lists?.personal || [];
+  const wishlist = lists?.wishlist || [];
+  const line = (label: string, items: string[]): string =>
+    items.length > 0
+      ? `Your ${label}: ${items.join(', ')}.`
+      : `Your ${label} is currently empty.`;
+  if (which === 'WISHLIST') return line('wishlist', wishlist);
+  if (which === 'PERSONAL') return line('personal list', personal);
+  if (which === 'FOR_HOME') return line('for-home list', forHome);
+  return [
+    line('wishlist', wishlist),
+    line('personal list', personal),
+    line('for-home list', forHome),
+  ].join('\n');
+}
+/**
  * Deterministic balance sentence from sheet values. Last-resort truth when
  * the LLM drops the mandatory balance figures twice — served verbatim.
  */
@@ -2455,6 +2858,16 @@ function buildClarificationQuestion(
       : 'What was the transaction for?';
   }
   if (missingFields.includes('mode')) {
+    // Direction-aware: a known CREDIT was never "paid" — asking "how did you
+    // pay for" a receipt proves the question is a hardcoded script. Receive
+    // wording for credits (with amount when known); pay wording otherwise.
+    const credit =
+      String(partialTxn?.direction || '').toUpperCase() === 'CREDIT';
+    if (credit) {
+      const what = desc ? `(${desc})` : 'it';
+      const howMuch = amount ? `${amount} ` : '';
+      return `How did you receive ${howMuch}${what}? (PhonePay/Wallet/Money/Bank)`;
+    }
     return desc
       ? `How did you pay for ${desc}? (PhonePay/Wallet/Money/Bank)`
       : 'How did you pay? (PhonePay/Wallet/Money/Bank)';

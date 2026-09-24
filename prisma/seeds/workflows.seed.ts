@@ -11,6 +11,7 @@ import { PrismaClient } from '@prisma/client';
 const TOOL_LOG_TRANSACTION_ID = 'a1b2c3d4-e5f6-4a5b-8c7d-9e0f1a2b3c4d';
 const TOOL_QUERY_TRANSACTIONS_ID = 'b2c3d4e5-f6a7-4b5c-8d7e-9f0a1b2c3d4e';
 const TOOL_GENERATE_CHART_ID = 'c3d4e5f6-a7b8-4c5d-8e7f-9a0b1c2d3e4f';
+const TOOL_READ_TERMINOLOGY_ID = 'd4e5f6a7-b8c9-4d6e-8f0a-1b2c3d4e5f60';
 
 /**
  * EXPENSE WORKFLOW — LLM SYSTEM PROMPT
@@ -73,6 +74,7 @@ export async function seedWorkflows(prisma: PrismaClient) {
     TOOL_LOG_TRANSACTION_ID,
     TOOL_QUERY_TRANSACTIONS_ID,
     TOOL_GENERATE_CHART_ID,
+    TOOL_READ_TERMINOLOGY_ID,
   ];
 
   await prisma.agentWorkflow.upsert({

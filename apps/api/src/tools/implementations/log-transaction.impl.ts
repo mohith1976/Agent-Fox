@@ -77,11 +77,189 @@ export class LogTransactionImpl {
     })))}`);
 
     try {
-      // STEP 1: Download workbook ONCE, capturing the base-version ETag
-      // BEFORE any mutation (compare-and-swap precondition for the upload).
-      this.logger.log(`[BATCH_TOOL] STEP 1 - Downloading workbook from S3, key=${s3KeyOverride || 'default'}`);
-      const { buffer: workbookBuffer, etag: baseVersionETag } =
-        await this.s3Service.downloadWithMetadata(s3KeyOverride);
+      // Year fan-out: a batch spanning Dec/Jan writes each year's rows to
+      // that year's book (Budget_2026.xlsx, Budget_2027.xlsx, …). Single-year
+      // batches take exactly the old path. An explicit s3KeyOverride (tests)
+      // pins EVERYTHING to that key, preserving legacy test behavior.
+      // Groups fail fast: the first failing year aborts the batch (a
+      // cross-book atomic commit is impossible; sequential + fail-fast is
+      // the documented contract).
+      const groups = s3KeyOverride
+        ? [{ key: s3KeyOverride, year: 0, transactions: input.transactions }]
+        : this.groupByYear(input.transactions);
+      const allResults: LogTransactionOutput[] = [];
+      for (const group of groups) {
+        const key =
+          group.year === 0
+            ? s3KeyOverride
+            : this.s3Service.workbookKeyFor(group.year);
+        const outcome = await this.writeYearGroup(
+          group.transactions,
+          key,
+          group.year,
+        );
+        allResults.push(...outcome.results);
+        if (!outcome.success) {
+          return {
+            success: false,
+            results: allResults,
+            error: outcome.error,
+          };
+        }
+      }
+
+      this.logger.log(
+        `[BATCH_TOOL] Batch write SUCCESS: ${input.transactions.length} transaction(s) persisted to S3`,
+      );
+
+      return {
+        success: true,
+        results: allResults,
+      };
+    } catch (error) {
+      this.logger.error(
+        `[BATCH_TOOL] EXCEPTION: ${error instanceof Error ? error.name : typeof error}`,
+      );
+      this.logger.error(
+        `[BATCH_TOOL] EXCEPTION MESSAGE: ${error instanceof Error ? error.message : String(error)}`,
+      );
+      this.logger.error(
+        `[BATCH_TOOL] EXCEPTION STACK: ${error instanceof Error ? error.stack : 'N/A'}`,
+      );
+
+      return {
+        success: false,
+        results: [],
+        error: error instanceof Error ? error.message : String(error),
+      };
+    }
+  }
+
+  /**
+   * Group batch transactions by calendar year of their date (invalid or
+   * missing dates fall back to the current year). Order-preserving.
+   */
+  private groupByYear(
+    transactions: LogTransactionInput[],
+  ): Array<{ year: number; transactions: LogTransactionInput[] }> {
+    const nowYear = new Date().getFullYear();
+    const groups = new Map<number, LogTransactionInput[]>();
+    for (const tx of transactions) {
+      let year = nowYear;
+      try {
+        const d =
+          typeof tx.date === 'string' ? new Date(tx.date) : (tx.date as Date);
+        if (d instanceof Date && !isNaN(d.getTime())) {
+          year = d.getFullYear();
+        }
+      } catch {
+        // Keep current-year fallback.
+      }
+      if (!groups.has(year)) {
+        groups.set(year, []);
+      }
+      groups.get(year)!.push(tx);
+    }
+    return [...groups.entries()].map(([y, txs]) => ({
+      year: y,
+      transactions: txs,
+    }));
+  }
+
+  /**
+   * Download a year's book, creating it from the default book when this is
+   * the first write of a new year. Returns buffer + base ETag for the CAS
+   * upload afterwards. A pinned test key (year 0) is downloaded as-is —
+   * never auto-structured (legacy test behavior).
+   */
+  private async downloadOrCreateYearBook(
+    s3Key: string | undefined,
+    year: number,
+  ): Promise<
+    | { ok: true; buffer: Buffer; etag: string }
+    | { ok: false; error: string }
+  > {
+    if (year === 0) {
+      const { buffer, etag } =
+        await this.s3Service.downloadWithMetadata(s3Key);
+      return { ok: true, buffer, etag };
+    }
+
+    const existingETag = await this.s3Service.headETag(s3Key);
+    if (existingETag) {
+      const { buffer, etag } =
+        await this.s3Service.downloadWithMetadata(s3Key);
+      return { ok: true, buffer, etag };
+    }
+
+    // CREATE path: template from the default (current) book.
+    this.logger.log(
+      `[BATCH_TOOL] Year book ${s3Key} missing — building ${year} from the current book`,
+    );
+    let templateBuffer: Buffer;
+    try {
+      const downloaded =
+        await this.s3Service.downloadWithMetadata(undefined);
+      templateBuffer = downloaded.buffer;
+    } catch {
+      return {
+        ok: false,
+        error:
+          'Current workbook not found in S3 — seed it before writing a new year.',
+      };
+    }
+    const templateWb = await this.excelService.loadWorkbook(templateBuffer);
+    const closings = await this.excelService.getCurrentBalances(templateWb);
+    const num = (v: number | null) =>
+      typeof v === 'number' && isFinite(v) ? v : 0;
+    const newWb = this.excelService.createYearWorkbook(templateWb, year, {
+      money: num(closings.MONEY),
+      bank: num(closings.BANK),
+      phonepay: num(closings.PHONEPAY),
+      wallet: num(closings.WALLET),
+    });
+    const createdBuffer = await this.excelService.exportWorkbook(newWb);
+    await this.s3Service.uploadWorkbook(createdBuffer, s3Key);
+
+    // A concurrent creator may have won the race — our rows would be lost
+    // in their version. Verify OUR bytes landed; otherwise fail retryably
+    // (the retry takes the normal CAS path against the winner's book).
+    const expectedETag = `"${crypto.createHash('md5').update(createdBuffer).digest('hex')}"`;
+    const nowETag = await this.s3Service.headETag(s3Key);
+    if (nowETag !== expectedETag) {
+      this.logger.error(
+        '[BATCH_TOOL] Year book created concurrently by another writer — failing safely for retry',
+      );
+      return {
+        ok: false,
+        error:
+          'Year workbook was created concurrently — please retry the write.',
+      };
+    }
+    return { ok: true, buffer: createdBuffer, etag: expectedETag };
+  }
+
+  /**
+   * Write one year-group to one workbook: download-or-create → load →
+   * terminology → balance guard → apply → validate → CAS upload.
+   * Identical to the legacy single-book flow when the group is the whole
+   * batch (same logs, same failure contract).
+   */
+  private async writeYearGroup(
+    transactions: LogTransactionInput[],
+    s3Key: string | undefined,
+    year: number,
+  ): Promise<BatchTransactionOutput> {
+    try {
+      // STEP 1: Download workbook (or create the year book), capturing the
+      // base-version ETag BEFORE any mutation (compare-and-swap precondition
+      // for the upload).
+      this.logger.log(`[BATCH_TOOL] STEP 1 - Downloading workbook from S3, key=${s3Key || 'default'}`);
+      const downloaded = await this.downloadOrCreateYearBook(s3Key, year);
+      if (!downloaded.ok) {
+        return { success: false, results: [], error: downloaded.error };
+      }
+      const { buffer: workbookBuffer, etag: baseVersionETag } = downloaded;
       this.logger.log(`[BATCH_TOOL] STEP 1 - Downloaded ${workbookBuffer.length} bytes (base ETag=${baseVersionETag})`);
 
       // STEP 2: Load workbook
@@ -104,7 +282,7 @@ export class LogTransactionImpl {
       this.logger.log(`[BATCH_TOOL] STEP 3b - Checking sufficient balances`);
       const balances = await this.excelService.getCurrentBalances(workbook);
       const netByMode: Record<string, number> = {};
-      for (const tx of input.transactions) {
+      for (const tx of transactions) {
         const mode = String(tx.mode || '').toUpperCase();
         const amt = Number(tx.amount) || 0;
         netByMode[mode] =
@@ -116,7 +294,7 @@ export class LogTransactionImpl {
         if (current === null || current === undefined) continue;
         const projected = current + net;
         if (projected < 0) {
-          const debitTotal = input.transactions
+          const debitTotal = transactions
             .filter(
               (tx) =>
                 String(tx.mode || '').toUpperCase() === mode &&
@@ -135,11 +313,11 @@ export class LogTransactionImpl {
       }
 
       // STEP 4: Apply ALL transactions deterministically in memory
-      this.logger.log(`[BATCH_TOOL] STEP 4 - Applying ${input.transactions.length} transactions to workbook`);
+      this.logger.log(`[BATCH_TOOL] STEP 4 - Applying ${transactions.length} transactions to workbook`);
       const results: LogTransactionOutput[] = [];
 
-      for (let i = 0; i < input.transactions.length; i++) {
-        const txInput = input.transactions[i];
+      for (let i = 0; i < transactions.length; i++) {
+        const txInput = transactions[i];
         this.logger.log(`[BATCH_TOOL] STEP 4.${i + 1} - Applying transaction: ${txInput.description}`);
         
         const result = await this.applyTransactionToWorkbook(
@@ -198,12 +376,12 @@ export class LogTransactionImpl {
       // Used to verify commit status if the upload times out mid-flight.
       const expectedETag = `"${crypto.createHash('md5').update(updatedBuffer).digest('hex')}"`;
 
-      this.logger.log(`[BATCH_TOOL] STEP 6 - Conditional upload to S3, key=${s3KeyOverride || 'default'}, IfMatch=${baseVersionETag}`);
+      this.logger.log(`[BATCH_TOOL] STEP 6 - Conditional upload to S3, key=${s3Key || 'default'}, IfMatch=${baseVersionETag}`);
       try {
         await this.s3Service.uploadConditional(
           updatedBuffer,
           { ifMatch: baseVersionETag },
-          s3KeyOverride,
+          s3Key,
         );
         this.logger.log(`[BATCH_TOOL] STEP 6 - Upload successful`);
       } catch (uploadError) {
@@ -224,7 +402,7 @@ export class LogTransactionImpl {
         // Timeout: unknown commit state. Verify via ETag comparison whether
         // OUR version reached S3 before deciding committed vs failed.
         if (code === 'S3_UPLOAD_TIMEOUT') {
-          const currentETag = await this.s3Service.headETag(s3KeyOverride);
+          const currentETag = await this.s3Service.headETag(s3Key);
           if (currentETag === expectedETag) {
             this.logger.log('[BATCH_TOOL] Upload timed out but ETag proves our version committed');
             return { success: true, results };
@@ -249,7 +427,7 @@ export class LogTransactionImpl {
 
       // STEP 7: Return success ONLY after upload succeeds
       this.logger.log(
-        `[BATCH_TOOL] Batch write SUCCESS: ${input.transactions.length} transaction(s) persisted to S3`,
+        `[BATCH_TOOL] Batch write SUCCESS: ${transactions.length} transaction(s) persisted to S3`,
       );
 
       return {

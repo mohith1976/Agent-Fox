@@ -6,6 +6,7 @@ import {
   PutObjectCommand,
   HeadBucketCommand,
   HeadObjectCommand,
+  ListObjectsV2Command,
 } from '@aws-sdk/client-s3';
 
 /**
@@ -120,6 +121,56 @@ export class S3Service {
         `S3 upload failed: ${error instanceof Error ? error.message : String(error)}`,
       );
     }
+  }
+
+  /** The configured key (current book) as-is, for fallback decisions. */
+  get defaultKey(): string {
+    return this.workbookKey;
+  }
+
+  /**
+   * Workbook key for a calendar year. The configured key stays the DEFAULT
+   * (current book) — a year is substituted only when it differs, so all
+   * current-year flows resolve to the exact same key as before (zero
+   * behavior change for the live book).
+   */
+  workbookKeyFor(year: number): string {
+    const base = this.workbookKey;
+    const match = base.match(/^(.*)(\d{4})(\.[^.]+)$/);
+    if (!match) {
+      return base;
+    }
+    if (Number(match[2]) === year) {
+      return base;
+    }
+    return `${match[1]}${year}${match[3]}`;
+  }
+
+  /**
+   * Year of a workbook key (parsed from a 4-digit year in the name), or null
+   * when the key carries none (treated as the default/current book).
+   */
+  yearOfKey(key: string): number | null {
+    const match = key.match(/(\d{4})/);
+    return match ? Number(match[1]) : null;
+  }
+
+  /**
+   * All yearly workbook keys present in the bucket (Budget_2026.xlsx,
+   * Budget_2027.xlsx, …), sorted ascending. Non-year keys are ignored.
+   */
+  async listWorkbookKeys(): Promise<string[]> {
+    const response = await this.s3Client.send(
+      new ListObjectsV2Command({
+        Bucket: this.bucket,
+        Prefix: 'Budget_',
+      }),
+    );
+    const keys = (response.Contents || [])
+      .map((o) => o.Key || '')
+      .filter((k) => k.endsWith('.xlsx') && this.yearOfKey(k) !== null)
+      .sort();
+    return keys;
   }
 
   /**

@@ -10,6 +10,7 @@ import { Injectable, Logger } from '@nestjs/common';
 import { LogTransactionImpl } from './implementations/log-transaction.impl';
 import { QueryTransactionsImpl } from './implementations/query-transactions.impl';
 import { GenerateChartImpl } from './implementations/generate-chart.impl';
+import { ReadTerminologyImpl } from './implementations/read-terminology.impl';
 import { ToolRegistryService } from './tool-registry.service';
 
 @Injectable()
@@ -20,6 +21,7 @@ export class ToolExecutorService {
     private readonly logTransactionImpl: LogTransactionImpl,
     private readonly queryTransactionsImpl: QueryTransactionsImpl,
     private readonly generateChartImpl: GenerateChartImpl,
+    private readonly readTerminologyImpl: ReadTerminologyImpl,
     private readonly toolRegistry: ToolRegistryService,
   ) {}
 
@@ -75,6 +77,9 @@ export class ToolExecutorService {
 
       case 'generate_chart':
         return this.generateChartImpl.execute(input);
+
+      case 'read_terminology':
+        return this.readTerminologyImpl.execute(input);
 
       default:
         throw new Error(`Tool implementation not found: ${toolCode}`);

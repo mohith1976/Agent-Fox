@@ -18,6 +18,7 @@ import { ToolExecutorService } from './tool-executor.service';
 import { LogTransactionImpl } from './implementations/log-transaction.impl';
 import { QueryTransactionsImpl } from './implementations/query-transactions.impl';
 import { GenerateChartImpl } from './implementations/generate-chart.impl';
+import { ReadTerminologyImpl } from './implementations/read-terminology.impl';
 
 @Module({
   imports: [
@@ -37,6 +38,7 @@ import { GenerateChartImpl } from './implementations/generate-chart.impl';
     LogTransactionImpl,
     QueryTransactionsImpl,
     GenerateChartImpl,
+    ReadTerminologyImpl,
   ],
   exports: [
     ToolRegistryService,
