@@ -401,6 +401,13 @@ export class ExcelService {
       // Commit row
       row.commit();
 
+      // Data-zone formats (owner's convention, gap-fill only): money cells
+      // carry the ₹ format, every data cell centers middle. New rows come
+      // from bare values (no numFmt/alignment), which rendered October as
+      // plain left/right numbers against September's ₹-formatted centered
+      // rows. Legacy cells already carry their own formats and are untouched.
+      this.normalizeDataFormats(sheet);
+
       // Update monthly summary if month sheet
       if (routing.sheetName !== 'CASH TRACKER') {
         await this.updateMonthlySummary(
@@ -857,9 +864,18 @@ export class ExcelService {
       const masterRow = Number(r1);
       const masterCol = colToNum(c1);
       const masterAddr = `${c1}${r1}`;
-      const masterValue = sheet.getRow(masterRow).getCell(masterAddr).value;
-      const masterStyle = sheet.getRow(masterRow).getCell(masterAddr).style
-        ? { ...sheet.getRow(masterRow).getCell(masterAddr).style }
+      // Re-merge ONLY what was merged: buildMonthSheet clears slaves BEFORE
+      // merging K11:M11 — re-merging here made the later mergeCells throw
+      // "Cannot merge already merged cells" and killed October creation.
+      const wasMerged = ((sheet.model.merges || []) as string[]).includes(
+        range,
+      );
+      // NOTE: worksheet-level getCell (address-aware). Row.getCell accepts
+      // only a bare column letter/number — passing 'C2' there throws
+      // "Out of bounds. Invalid column letter: C2" (Oct-1 month rollover bug).
+      const masterValue = sheet.getCell(masterAddr).value;
+      const masterStyle = sheet.getCell(masterAddr).style
+        ? { ...sheet.getCell(masterAddr).style }
         : undefined;
       try {
         sheet.unMergeCells(range);
@@ -881,15 +897,110 @@ export class ExcelService {
           }
         }
       }
-      const master = sheet.getRow(masterRow).getCell(masterAddr);
+      const master = sheet.getCell(masterAddr);
       master.value = masterValue as ExcelJS.CellValue;
       if (masterStyle) {
         master.style = masterStyle;
       }
-      try {
-        sheet.mergeCells(range);
-      } catch {
-        // Cosmetic only — data already correct unmerged.
+      if (wasMerged) {
+        try {
+          sheet.mergeCells(range);
+        } catch {
+          // Cosmetic only — data already correct unmerged.
+        }
+      }
+    }
+  }
+
+  /**
+   * Book number formats, cloned from the owner's hand-made rows (September):
+   * dates read "02 September 2026", money reads "₹ 1,000.00".
+   */
+  private static readonly DATE_FMT = '[$-F800]dddd, mmmm dd, yyyy';
+  private static readonly MONEY_FMT = '"₹" #,##0.00';
+
+  /**
+   * Data-zone presentation for one sheet's transaction rows. Owner's rule:
+   * every data cell centers middle — no left/right strays (October rendered
+   * Excel defaults against September's centered book). Alignment is
+   * presentational, so it applies uniformly; wrapText already present is
+   * preserved. Number formats are gap-filled only (missing/General/mm-dd-yy):
+   * date cells get the book date format, numeric money cells (debit/credit/
+   * balances) the ₹ format. Values and fills are never touched.
+   */
+  private normalizeDataFormats(sheet: ExcelJS.Worksheet): void {
+    const isCash = sheet.name === 'CASH TRACKER';
+    if (sheet.name === 'TERMINOLOGY') {
+      return;
+    }
+    const startRow = isCash ? 11 : 5;
+    const textCols = isCash ? ['B', 'C', 'D', 'E'] : ['C', 'D', 'E'];
+    const dateCols = ['C'];
+    const moneyCols = ['F', 'G', 'H', 'I'];
+    for (let r = startRow; r <= sheet.rowCount; r++) {
+      const row = sheet.getRow(r);
+      if (!row.getCell('C').value) {
+        continue;
+      }
+      for (const col of textCols) {
+        const cell = row.getCell(col);
+        const keepWrap =
+          cell.alignment?.wrapText ??
+          (dateCols.includes(col) || col === 'D' || col === 'E');
+        cell.style = { ...cell.style };
+        cell.alignment = {
+          horizontal: 'center',
+          vertical: 'middle',
+          wrapText: keepWrap,
+        };
+        // Descriptions never wear money formats: a ₹ numFmt on text is
+        // Excel-diffusion residue, never owner intent — clear it so the text
+        // renders exactly as typed. Null/empty cells are left alone.
+        if (
+          cell.value !== null &&
+          cell.value !== undefined &&
+          cell.value !== '' &&
+          typeof cell.value !== 'number' &&
+          typeof cell.numFmt === 'string' &&
+          cell.numFmt.includes('₹')
+        ) {
+          const next = { ...cell.style };
+          delete (next as Record<string, unknown>).numFmt;
+          cell.style = next;
+        }
+      }
+      for (const col of moneyCols) {
+        const cell = row.getCell(col);
+        if (
+          typeof cell.value === 'number' &&
+          (cell.numFmt === undefined ||
+            cell.numFmt === null ||
+            cell.numFmt === '' ||
+            cell.numFmt === 'General' ||
+            cell.numFmt === 'mm-dd-yy')
+        ) {
+          cell.style = { ...cell.style };
+          cell.numFmt = ExcelService.MONEY_FMT;
+        }
+        const keepWrap = cell.alignment?.wrapText ?? false;
+        cell.style = { ...cell.style };
+        cell.alignment = {
+          horizontal: 'center',
+          vertical: 'middle',
+          wrapText: keepWrap,
+        };
+      }
+      const dateCell = row.getCell('C');
+      if (
+        dateCell.value instanceof Date &&
+        (dateCell.numFmt === undefined ||
+          dateCell.numFmt === null ||
+          dateCell.numFmt === '' ||
+          dateCell.numFmt === 'General' ||
+          dateCell.numFmt === 'mm-dd-yy')
+      ) {
+        dateCell.style = { ...dateCell.style };
+        dateCell.numFmt = ExcelService.DATE_FMT;
       }
     }
   }
